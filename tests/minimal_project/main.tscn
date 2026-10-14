@@ -1,0 +1,21 @@
+[gd_scene format=3]
+
+[sub_resource type="BoxMesh" id="BoxMesh_6pp4k"]
+size = Vector3(10, 0.2, 10)
+
+[sub_resource type="BoxMesh" id="BoxMesh_qiemb"]
+
+[node name="Main" type="Node3D" unique_id=2089990531]
+
+[node name="Ground" type="MeshInstance3D" parent="." unique_id=1751304787]
+mesh = SubResource("BoxMesh_6pp4k")
+
+[node name="Cube" type="MeshInstance3D" parent="." unique_id=1861875501]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.5, 0)
+mesh = SubResource("BoxMesh_qiemb")
+
+[node name="Sun" type="DirectionalLight3D" parent="." unique_id=1093488309]
+transform = Transform3D(0.8253356, -0.44229966, 0.3509874, 0, 0.62161, 0.7833269, -0.5646425, -0.6465076, 0.51303685, 0, 0, 0)
+
+[node name="Camera" type="Camera3D" parent="." unique_id=170955851]
+transform = Transform3D(0.8253356, -0.29513144, 0.48137155, 0, 0.8525245, 0.52268726, -0.5646425, -0.4313924, 0.7036188, 4, 4, 6)

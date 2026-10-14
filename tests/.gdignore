@@ -1,0 +1,4 @@
+# Keep the Godot editor from scanning the nested test project
+# (tests/minimal_project contains its own project.godot). This file only
+# affects scanning of the parent project; the nested project remains openable
+# on its own.

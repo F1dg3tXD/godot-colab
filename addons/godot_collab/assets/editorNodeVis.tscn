@@ -1,0 +1,73 @@
+[gd_scene format=3 uid="uid://bisavoa4hvn68"]
+
+[ext_resource type="Script" uid="uid://bi7b3g82wlrps" path="res://addons/godot_collab/assets/editor_node_vis.gd" id="1_tnv6x"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_qjxf3"]
+transparency = 1
+albedo_color = Color(1, 0, 0, 0.6)
+emission_enabled = true
+emission = Color(1, 0, 0, 0.6)
+rim = 0.1
+rim_tint = 0.45
+uv1_triplanar = true
+
+[sub_resource type="ViewportTexture" id="ViewportTexture_tnv6x"]
+viewport_path = NodePath("usernameUI")
+
+[sub_resource type="LabelSettings" id="LabelSettings_tnv6x"]
+font_size = 24
+font_color = Color(1, 0, 0, 0.6)
+outline_size = 10
+outline_color = Color(0, 0, 0, 1)
+
+[node name="EditorNodeVis" type="Node3D" unique_id=1689922859]
+script = ExtResource("1_tnv6x")
+
+[node name="CSGSphere3D" type="CSGSphere3D" parent="." unique_id=1631432868]
+material_override = SubResource("StandardMaterial3D_qjxf3")
+cast_shadow = 0
+autosmooth = true
+radial_segments = 32
+rings = 16
+
+[node name="CSGCylinder3D" type="CSGCylinder3D" parent="CSGSphere3D" unique_id=1570029731]
+transform = Transform3D(1, 0, 0, 0, -4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0.6926599)
+radius = 0.05
+height = 0.5
+sides = 16
+
+[node name="CSGPolygon3D" type="CSGPolygon3D" parent="CSGSphere3D/CSGCylinder3D" unique_id=374779098]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.2212109, -9.669439e-09)
+polygon = PackedVector2Array(0, 0, 0, 0.3, 0.1, 0)
+mode = 1
+spin_degrees = 360.0
+spin_sides = 16
+
+[node name="UserNameDisplay" type="Sprite3D" parent="." unique_id=1188186880]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.9990418, 0)
+cast_shadow = 0
+billboard = 1
+alpha_cut = 2
+texture = SubResource("ViewportTexture_tnv6x")
+
+[node name="usernameUI" type="SubViewport" parent="." unique_id=1431948464]
+transparent_bg = true
+size = Vector2i(480, 64)
+render_target_update_mode = 4
+
+[node name="CenterContainer" type="CenterContainer" parent="usernameUI" unique_id=2014000001]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+
+[node name="$user" type="Label" parent="usernameUI/CenterContainer" unique_id=282234808]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(448, 0)
+layout_mode = 2
+text = "TestName"
+label_settings = SubResource("LabelSettings_tnv6x")
+horizontal_alignment = 1
+vertical_alignment = 1
+autowrap_mode = 3

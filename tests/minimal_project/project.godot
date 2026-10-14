@@ -1,0 +1,18 @@
+; Engine configuration file.
+; Minimal Godot 4.7 project used for reproducible manual GodotCollab tests.
+; Before opening, copy the add-on in:
+;   cp -r addons/godot_collab <this_project>/addons/godot_collab
+; then enable it under Project > Project Settings > Plugins.
+
+config_version=5
+
+[application]
+
+config/name="GodotCollab Test Project"
+config/description="Minimal 3D scene for two-instance collaboration tests."
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.7", "Forward Plus")
+
+[rendering]
+
+renderer/rendering_method="forward_plus"

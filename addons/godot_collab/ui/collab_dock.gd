@@ -1,0 +1,469 @@
+@tool
+## Editor dock for the Godot Collab add-on.
+##
+## The dock is deliberately presentation-only: it collects user intent, emits
+## signals, and renders state pushed by the plugin. It never speaks the wire
+## protocol or touches editor internals directly.
+class_name CollabDock
+extends VBoxContainer
+
+signal host_requested(username: String, port: int, mode: int, use_rendezvous: bool)
+signal join_requested(invite: String)
+signal disconnect_requested()
+signal approve_requested(peer_id: int)
+signal reject_requested(peer_id: int)
+signal kick_requested(peer_id: int)
+signal save_requested()
+signal download_requested(root: String)
+signal cancel_transfer_requested()
+signal snapshot_requested()
+signal snapshot_apply_requested()
+signal snapshot_discard_requested()
+signal username_changed(username: String)
+
+const MODE_HOST_WORKSPACE: int = 0
+const MODE_GIT_PRESENCE: int = 1
+
+var _settings: CollabSettings
+var _built: bool = false
+var _scroll: ScrollContainer
+var _content: VBoxContainer
+
+var _username_edit: LineEdit
+var _port_spin: SpinBox
+var _mode_option: OptionButton
+var _rendezvous_check: CheckBox
+var _approve_check: CheckBox
+var _status_label: Label
+var _connectivity_label: Label
+var _mode_label: Label
+var _host_button: Button
+var _join_button: Button
+var _disconnect_button: Button
+var _invite_view: TextEdit
+var _copy_button: Button
+var _invite_input: LineEdit
+var _participant_list: ItemList
+var _request_list: ItemList
+var _approve_button: Button
+var _reject_button: Button
+var _kick_button: Button
+var _request_box: VBoxContainer
+var _sync_label: Label
+var _project_label: Label
+var _save_label: Label
+var _progress_label: Label
+var _transfer_dir_edit: LineEdit
+var _download_button: Button
+var _cancel_button: Button
+var _save_button: Button
+var _snapshot_button: Button
+var _messages: RichTextLabel
+var _requests: Array = [] # [{peer_id, name}]
+var _participants: Array = []
+
+
+func setup(settings: CollabSettings) -> void:
+	_settings = settings
+	if not _built:
+		_build()
+	_username_edit.text = settings.get_string(CollabSettings.KEY_USERNAME, "")
+	_port_spin.value = settings.get_int(CollabSettings.KEY_PORT, CollabConstants.DEFAULT_PORT)
+	_rendezvous_check.button_pressed = settings.get_string(CollabSettings.KEY_RENDEZVOUS_URL, "").is_empty() == false
+	_approve_check.button_pressed = settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, true)
+	_transfer_dir_edit.text = settings.get_string(CollabSettings.KEY_TRANSFER_DIR, "")
+
+
+func _ready() -> void:
+	if not _built:
+		_build()
+
+
+func _build() -> void:
+	if _built:
+		return
+	_built = true
+	size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	size_flags_vertical = Control.SIZE_EXPAND_FILL
+
+	# All content lives inside a ScrollContainer so the dock stays usable when
+	# the editor font/window scale is increased or the dock is short: options
+	# scroll vertically instead of being cut off.
+	_scroll = ScrollContainer.new()
+	_scroll.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	_scroll.follow_focus = true
+	add_child(_scroll)
+
+	_content = VBoxContainer.new()
+	_content.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_content.add_theme_constant_override("separation", 6)
+	_scroll.add_child(_content)
+
+	var title := Label.new()
+	title.text = "Godot Collab"
+	title.add_theme_font_size_override("font_size", 15)
+	_content.add_child(title)
+
+	var identity_box := _section("Identity")
+	_username_edit = LineEdit.new()
+	_username_edit.placeholder_text = "Username"
+	_username_edit.tooltip_text = "Your display name, shown to other collaborators."
+	_username_edit.text_changed.connect(func(text: String) -> void: username_changed.emit(text))
+	identity_box.add_child(_row("Username", _username_edit))
+
+	var session_box := _section("Session")
+	_status_label = Label.new()
+	_status_label.text = "Status: not connected"
+	_status_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	session_box.add_child(_status_label)
+	_connectivity_label = Label.new()
+	_connectivity_label.text = "Connectivity: unknown"
+	_connectivity_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	session_box.add_child(_connectivity_label)
+	_mode_label = Label.new()
+	_mode_label.text = "Mode: host-owned workspace"
+	session_box.add_child(_mode_label)
+
+	_mode_option = OptionButton.new()
+	_mode_option.add_item("Host-owned workspace", MODE_HOST_WORKSPACE)
+	_mode_option.add_item("Git presence only", MODE_GIT_PRESENCE)
+	session_box.add_child(_row("Host mode", _mode_option))
+
+	_port_spin = SpinBox.new()
+	_port_spin.min_value = 1024
+	_port_spin.max_value = 65535
+	_port_spin.step = 1
+	_port_spin.value = CollabConstants.DEFAULT_PORT
+	session_box.add_child(_row("UDP port", _port_spin))
+
+	_rendezvous_check = CheckBox.new()
+	_rendezvous_check.text = "Use rendezvous for a short invite code"
+	_rendezvous_check.tooltip_text = "Requires a reachable rendezvous service. Otherwise a direct code is used."
+	session_box.add_child(_rendezvous_check)
+
+	_approve_check = CheckBox.new()
+	_approve_check.text = "Require host approval for new participants"
+	session_box.add_child(_approve_check)
+
+	var host_row := HBoxContainer.new()
+	_host_button = Button.new()
+	_host_button.text = "Host Session"
+	_host_button.pressed.connect(_on_host_pressed)
+	host_row.add_child(_host_button)
+	_join_button = Button.new()
+	_join_button.text = "Join Session"
+	_join_button.pressed.connect(_on_join_pressed)
+	host_row.add_child(_join_button)
+	_disconnect_button = Button.new()
+	_disconnect_button.text = "Disconnect"
+	_disconnect_button.disabled = true
+	_disconnect_button.pressed.connect(func() -> void: disconnect_requested.emit())
+	host_row.add_child(_disconnect_button)
+	session_box.add_child(host_row)
+
+	var invite_box := _section("Invitation code")
+	_invite_view = TextEdit.new()
+	_invite_view.editable = false
+	_invite_view.custom_minimum_size = Vector2(0, 54)
+	_invite_view.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	invite_box.add_child(_invite_view)
+	_copy_button = Button.new()
+	_copy_button.text = "Copy invitation"
+	_copy_button.pressed.connect(_on_copy_pressed)
+	invite_box.add_child(_copy_button)
+
+	var join_box := _section("Join")
+	_invite_input = LineEdit.new()
+	_invite_input.placeholder_text = "Paste invitation code or host:port"
+	join_box.add_child(_invite_input)
+	var join_action := Button.new()
+	join_action.text = "Join"
+	join_action.pressed.connect(_on_join_pressed)
+	join_box.add_child(join_action)
+
+	var participants_box := _section("Participants")
+	_participant_list = ItemList.new()
+	_participant_list.custom_minimum_size = Vector2(0, 90)
+	participants_box.add_child(_participant_list)
+	_kick_button = Button.new()
+	_kick_button.text = "Remove selected"
+	_kick_button.pressed.connect(_on_kick_pressed)
+	participants_box.add_child(_kick_button)
+
+	_request_box = _section("Join requests")
+	_request_list = ItemList.new()
+	_request_list.custom_minimum_size = Vector2(0, 60)
+	_request_box.add_child(_request_list)
+	var request_actions := HBoxContainer.new()
+	_approve_button = Button.new()
+	_approve_button.text = "Approve"
+	_approve_button.pressed.connect(_on_approve_pressed)
+	request_actions.add_child(_approve_button)
+	_reject_button = Button.new()
+	_reject_button.text = "Reject"
+	_reject_button.pressed.connect(_on_reject_pressed)
+	request_actions.add_child(_reject_button)
+	_request_box.add_child(request_actions)
+	_request_box.visible = false
+
+	var scene_box := _section("Scene collaboration")
+	_sync_label = Label.new()
+	_sync_label.text = "Scene: idle"
+	_sync_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	scene_box.add_child(_sync_label)
+	var snapshot_row := HBoxContainer.new()
+	_snapshot_button = Button.new()
+	_snapshot_button.text = "Request snapshot"
+	_snapshot_button.pressed.connect(func() -> void: snapshot_requested.emit())
+	snapshot_row.add_child(_snapshot_button)
+	var apply_button := Button.new()
+	apply_button.text = "Apply pending"
+	apply_button.pressed.connect(func() -> void: snapshot_apply_requested.emit())
+	snapshot_row.add_child(apply_button)
+	var discard_button := Button.new()
+	discard_button.text = "Discard pending"
+	discard_button.pressed.connect(func() -> void: snapshot_discard_requested.emit())
+	snapshot_row.add_child(discard_button)
+	scene_box.add_child(snapshot_row)
+	_save_button = Button.new()
+	_save_button.text = "Save shared scene"
+	_save_button.pressed.connect(func() -> void: save_requested.emit())
+	scene_box.add_child(_save_button)
+	_save_label = Label.new()
+	_save_label.text = "Save: no save yet"
+	_save_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	scene_box.add_child(_save_label)
+
+	var project_box := _section("Project transfer")
+	_project_label = Label.new()
+	_project_label.text = "Project: idle"
+	_project_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	project_box.add_child(_project_label)
+	_transfer_dir_edit = LineEdit.new()
+	_transfer_dir_edit.placeholder_text = "Download directory (blank = user data)"
+	project_box.add_child(_transfer_dir_edit)
+	var transfer_row := HBoxContainer.new()
+	_download_button = Button.new()
+	_download_button.text = "Download project"
+	_download_button.pressed.connect(_on_download_pressed)
+	transfer_row.add_child(_download_button)
+	_cancel_button = Button.new()
+	_cancel_button.text = "Cancel"
+	_cancel_button.pressed.connect(func() -> void: cancel_transfer_requested.emit())
+	transfer_row.add_child(_cancel_button)
+	project_box.add_child(transfer_row)
+	_progress_label = Label.new()
+	_progress_label.text = ""
+	_progress_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	project_box.add_child(_progress_label)
+
+	var messages_box := _section("Messages")
+	_messages = RichTextLabel.new()
+	_messages.bbcode_enabled = true
+	_messages.fit_content = true
+	_messages.scroll_active = false
+	_messages.custom_minimum_size = Vector2(0, 60)
+	messages_box.add_child(_messages)
+
+
+func _section(title_text: String) -> VBoxContainer:
+	var container := VBoxContainer.new()
+	container.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	container.add_theme_constant_override("separation", 3)
+	var header := Label.new()
+	header.text = title_text
+	header.add_theme_font_size_override("font_size", 13)
+	container.add_child(header)
+	_content.add_child(container)
+	_content.add_child(HSeparator.new())
+	return container
+
+
+func _row(label_text: String, control: Control) -> HBoxContainer:
+	var row := HBoxContainer.new()
+	var label := Label.new()
+	label.text = label_text
+	label.custom_minimum_size = Vector2(72, 0)
+	row.add_child(label)
+	control.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(control)
+	return row
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+func _on_host_pressed() -> void:
+	var username: String = _username_edit.text.strip_edges()
+	var port: int = int(_port_spin.value)
+	var mode: int = _mode_option.get_selected_id()
+	var use_rendezvous: bool = _rendezvous_check.button_pressed
+	if _settings != null:
+		_settings.set_value(CollabSettings.KEY_PORT, port)
+		_settings.set_value(CollabSettings.KEY_APPROVE_JOINS, _approve_check.button_pressed)
+	host_requested.emit(username, port, mode, use_rendezvous)
+
+
+func _on_join_pressed() -> void:
+	var invite: String = _invite_input.text.strip_edges()
+	if invite.is_empty():
+		push_message("Enter an invitation code or host:port.", true)
+		return
+	join_requested.emit(invite)
+
+
+func _on_copy_pressed() -> void:
+	var text: String = _invite_view.text.strip_edges()
+	if text.is_empty():
+		push_message("No invitation code to copy.", true)
+		return
+	DisplayServer.clipboard_set(text)
+	push_message("Invitation code copied to clipboard.", false)
+
+
+func _on_approve_pressed() -> void:
+	var selected: PackedInt32Array = _request_list.get_selected_items()
+	if selected.is_empty():
+		return
+	var entry: Dictionary = _requests[selected[0]]
+	approve_requested.emit(int(entry.get("peer_id", 0)))
+
+
+func _on_reject_pressed() -> void:
+	var selected: PackedInt32Array = _request_list.get_selected_items()
+	if selected.is_empty():
+		return
+	var entry: Dictionary = _requests[selected[0]]
+	reject_requested.emit(int(entry.get("peer_id", 0)))
+
+
+func _on_kick_pressed() -> void:
+	var selected: PackedInt32Array = _participant_list.get_selected_items()
+	if selected.is_empty():
+		return
+	var participant: CollabParticipant = _participants[selected[0]]
+	if participant.is_host:
+		push_message("The host cannot be removed.", true)
+		return
+	kick_requested.emit(participant.peer_id)
+
+
+func _on_download_pressed() -> void:
+	var root: String = _transfer_dir_edit.text.strip_edges()
+	if _settings != null:
+		_settings.set_value(CollabSettings.KEY_TRANSFER_DIR, root)
+	download_requested.emit(root)
+
+
+# ---------------------------------------------------------------------------
+# State pushed by the plugin
+# ---------------------------------------------------------------------------
+
+func set_connection_status(state: int, text: String) -> void:
+	if _status_label == null:
+		return
+	_status_label.text = "Status: %s" % text
+	_disconnect_button.disabled = state == CollabConstants.ConnectionState.DISCONNECTED
+	var active: bool = state != CollabConstants.ConnectionState.DISCONNECTED
+	_host_button.disabled = active
+	_join_button.disabled = active
+
+
+func set_connectivity(state: int, detail: String) -> void:
+	if _connectivity_label == null:
+		return
+	var names: Array[String] = ["unknown", "LAN only", "direct (externally reachable)", "relay"]
+	_connectivity_label.text = "Connectivity: %s - %s" % [names[state] if state >= 0 and state < names.size() else "unknown", detail]
+
+
+func set_mode(mode: int) -> void:
+	if _mode_label == null:
+		return
+	if mode == MODE_GIT_PRESENCE:
+		_mode_label.text = "Mode: Git presence only (no file sync)"
+	else:
+		_mode_label.text = "Mode: host-owned workspace"
+
+
+func set_hosting_controls(active: bool) -> void:
+	if _request_box == null:
+		return
+	_request_box.visible = active and not _requests.is_empty()
+	if not active:
+		_requests.clear()
+		_request_list.clear()
+
+
+func set_participants(list: Array) -> void:
+	if _participant_list == null:
+		return
+	_participants = list
+	_participant_list.clear()
+	for participant in list:
+		if participant == null:
+			continue
+		_participant_list.add_item(participant.display_name())
+
+
+func add_join_request(peer_id: int, name: String) -> void:
+	if _request_list == null:
+		return
+	for entry in _requests:
+		if int(entry.get("peer_id", 0)) == peer_id:
+			return
+	_requests.append({"peer_id": peer_id, "name": name})
+	_request_list.add_item("%s (%d)" % [name, peer_id])
+	_request_box.visible = true
+	push_message("'%s' wants to join. Approve or reject.", false)
+
+
+func remove_join_request(peer_id: int) -> void:
+	if _request_list == null:
+		return
+	for i in _requests.size():
+		if int((_requests[i] as Dictionary).get("peer_id", 0)) == peer_id:
+			_requests.remove_at(i)
+			_request_list.remove_item(i)
+			break
+	if _requests.is_empty():
+		_request_box.visible = false
+
+
+func set_invite(invite: String) -> void:
+	if _invite_view == null:
+		return
+	_invite_view.text = invite
+
+
+func set_sync_status(text: String) -> void:
+	if _sync_label != null:
+		_sync_label.text = "Scene: %s" % text
+
+
+func set_project_status(text: String) -> void:
+	if _project_label != null:
+		_project_label.text = "Project: %s" % text
+
+
+func set_save_status(text: String) -> void:
+	if _save_label != null:
+		_save_label.text = "Save: %s" % text
+
+
+func set_transfer_progress(text: String) -> void:
+	if _progress_label != null:
+		_progress_label.text = text
+
+
+func push_message(text: String, is_error: bool) -> void:
+	if _messages == null:
+		return
+	var color: String = "ff8888" if is_error else "a0d0ff"
+	_messages.append_text("[color=#%s]%s[/color]\n" % [color, _bbcode_escape(text)])
+
+
+func _bbcode_escape(text: String) -> String:
+	return text.replace("[", "\\[").replace("]", "\\]")
