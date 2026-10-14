@@ -30,6 +30,11 @@ var scene_id: String = ""
 ## broadcasts nor applies scene operations, and it never sends or accepts
 ## snapshots.
 var enabled: bool = true
+## When true a non-host automatically applies an incoming snapshot. In
+## host-workspace mode the host owns the authoritative scene, so a peer should
+## immediately mirror whatever the host currently has instead of waiting for a
+## manual confirmation.
+var auto_apply_snapshot: bool = true
 
 var _coordinator: CollabSessionCoordinator
 var _logs: CollabLog
@@ -135,13 +140,15 @@ func _on_scene_message(from_peer: int, type: int, payload: Dictionary) -> void:
 		CollabProtocol.MessageType.OPS_REJECT:
 			var reason: int = int(payload.get("reason", CollabProtocol.Reason.UNSUPPORTED_OPERATION))
 			conflict.emit("Operation rejected: %s (reason %d)" % [str(payload.get("message", "")), reason])
-			request_snapshot()
 		CollabProtocol.MessageType.SNAPSHOT_REQUEST:
 			if _coordinator.is_host():
 				_send_snapshot_to(from_peer)
 		CollabProtocol.MessageType.SNAPSHOT_RESPONSE:
 			_pending_snapshot = payload
-			snapshot_offered.emit((payload.get("nodes", []) as Array).size(), int(payload.get("revision", 0)))
+			if auto_apply_snapshot and not _coordinator.is_host():
+				apply_pending_snapshot()
+			else:
+				snapshot_offered.emit((payload.get("nodes", []) as Array).size(), int(payload.get("revision", 0)))
 		CollabProtocol.MessageType.RESYNC_REQUIRED:
 			if not _coordinator.is_host():
 				conflict.emit("Host requested a resync: %s" % str(payload.get("message", "")))
@@ -248,6 +255,7 @@ func _apply_create(op: Dictionary) -> void:
 		error_raised.emit("Cannot create unsupported node type '%s'." % str(op.get("node_class", "")))
 		return
 	node.name = _safe_name(str(op.get("name", node.get_class())))
+	_apply_script(node, op)
 	var parent: Node = _find_parent(int(op.get("parent_id", -1)))
 	if parent == null:
 		parent = _edited_root()
@@ -350,9 +358,8 @@ func request_snapshot() -> void:
 func apply_pending_snapshot() -> void:
 	if _pending_snapshot.is_empty():
 		return
-	var snapshot: Dictionary = _pending_snapshot
-	_pending_snapshot = {}
-	_apply_snapshot(snapshot)
+	if _apply_snapshot(_pending_snapshot):
+		_pending_snapshot = {}
 
 
 func discard_pending_snapshot() -> void:
@@ -385,6 +392,7 @@ func _serialize_node(node: Node, parent_id: int, out: Array, is_root: bool) -> v
 		"parent_id": parent_id,
 		"class": node.get_class(),
 		"name": node.name,
+		"script": _script_path(node),
 		"props": _serialize_props(node),
 	}
 	if node is Node3D:
@@ -406,25 +414,24 @@ func _id_for(node: Node) -> int:
 	return allocated
 
 
-func _apply_snapshot(snapshot: Dictionary) -> void:
+func _apply_snapshot(snapshot: Dictionary) -> bool:
 	var root: Node = _edited_root()
 	if root == null:
-		error_raised.emit("No edited scene to apply the snapshot to.")
-		return
+		error_raised.emit("No edited scene to apply the snapshot to. Open the shared scene first.")
+		return false
 	var remote_scene: String = str(snapshot.get("scene_id", ""))
 	if not remote_scene.is_empty() and not scene_id.is_empty() and remote_scene != scene_id:
 		conflict.emit("Snapshot is for scene '%s' but '%s' is open. Open the same scene first." % [remote_scene, scene_id])
-		return
+		return false
 	var nodes: Array = snapshot.get("nodes", [])
 	if nodes.is_empty():
-		return
+		return false
 	_applying = true
 	node_ids.clear()
 	_aliases.clear()
 	var root_entry: Dictionary = nodes[0]
 	var root_snapshot_id: int = int(root_entry.get("node_id", -1))
-	# Destructive by design: the host scene replaces local content. The dock
-	# confirms before this is called.
+	# Destructive by design: the host scene replaces local content.
 	for child in root.get_children():
 		root.remove_child(child)
 		child.queue_free()
@@ -440,6 +447,7 @@ func _apply_snapshot(snapshot: Dictionary) -> void:
 	_mark_unsaved()
 	snapshot_applied.emit()
 	status.emit("Applied snapshot (%d nodes, revision %d)." % [nodes.size(), revision])
+	return true
 
 
 func _apply_snapshot_node(entry: Dictionary) -> void:
@@ -450,6 +458,7 @@ func _apply_snapshot_node(entry: Dictionary) -> void:
 	if node == null:
 		return
 	node.name = _safe_name(str(entry.get("name", node.get_class())))
+	_apply_script(node, entry)
 	var parent: Node = node_ids.node_for(int(entry.get("parent_id", -1)), false)
 	if parent == null:
 		parent = _edited_root()
@@ -535,6 +544,32 @@ func _instantiate_class(class_name_str: String) -> Node:
 		return null
 	var instance: Variant = ClassDB.instantiate(class_name_str)
 	return instance as Node
+
+
+## Returns the resource path of a node's script, or "" when it has none. Only
+## project-local scripts (`res://`) are shared; both peers run the same project
+## so the path resolves to the same file on each side.
+func _script_path(node: Node) -> String:
+	var script: Script = node.get_script()
+	if script == null:
+		return ""
+	var path: String = script.resource_path
+	if path.is_empty() or not path.begins_with("res://") or path.contains(".."):
+		return ""
+	return path
+
+
+## Attaches a shared script path to a freshly created node, if the path is a
+## safe project-local script that exists locally.
+func _apply_script(node: Node, source: Dictionary) -> void:
+	var path: String = str(source.get("script", ""))
+	if path.is_empty() or not path.begins_with("res://") or path.contains(".."):
+		return
+	if not ResourceLoader.exists(path):
+		return
+	var script: Resource = load(path)
+	if script is Script:
+		node.set_script(script)
 
 
 func _own_recursive(node: Node) -> void:

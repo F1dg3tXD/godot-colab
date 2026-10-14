@@ -544,6 +544,7 @@ func _ensure_scene_binding() -> void:
 	var root: Node = _edited_root()
 	# Git presence mode is presence-only: scene operations and transfers stay off.
 	_scene_sync.enabled = _coordinator.workspace_mode == CollabConstants.WorkspaceMode.HOST_WORKSPACE
+	_scene_sync.auto_apply_snapshot = _scene_sync.enabled and _settings.get_bool(CollabSettings.KEY_AUTO_APPLY_SNAPSHOT, true)
 	if root == _attached_root:
 		return
 	_attached_root = root

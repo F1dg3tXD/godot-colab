@@ -15,8 +15,11 @@ cd /path/to/godot-colab
   is printed individually.
 - The suite covers: protocol framing/validation (bad magic, truncated packets,
   oversized payloads, non-dictionary payloads), invitation code encode/decode,
-  path guard (traversal/absolute/symlink), rate limiter, and an ENet loopback
-  host/client handshake with cursor relay and host-disconnect detection.
+  path guard (traversal/absolute/symlink), rate limiter, marker scene
+  instantiation with username/colour application and no-op default colour, an
+  ENet loopback host/client handshake with cursor relay and host-disconnect
+  detection, and a two-scene loopback test where a host scene is snapshotted to
+  a joining peer and host/peer transform edits propagate both ways.
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -26,9 +29,10 @@ context):
   | grep -iE "SCRIPT ERROR|Parse Error|Compile Error|Failed to load"
 ```
 
-Any `Unicode parsing error ... Unexpected NUL character` lines are a false
-positive: Godot parses its own `.godot/` import/cache binaries, not project
-source files.
+Any `Unicode parsing error ... Unexpected NUL character` lines come from Godot
+parsing its own `.godot/` import/cache binaries, not project source files. Addon
+source must not contain literal NUL escapes (that would be a real bug the parser
+reports).
 
 Optional rendezvous service (Python 3 stdlib only):
 
@@ -78,10 +82,12 @@ instances, enable **Godot Collab** in each, and run through the checks:
 6. **Incompatible project/scene warning.** Open a different scene in Bob (or
    point the two copies at different project identities). A clear
    compatibility/scene warning appears rather than silent corruption.
-7. **Supported edits replicate.** Transform the `Cube` via the Inspector and the
-   3D gizmo; rename it; add/remove a supported node; reparent it. Changes appear
-   on both peers with no rebroadcast loop (check the Output panel for repeated
-   application).
+7. **Host scene mirrors to peers + supported edits replicate.** When Bob joins,
+   his edited scene automatically mirrors Alice's (host) scene tree. Then
+   transform the `Cube` via the Inspector and the 3D gizmo; rename it; add/remove
+   a supported node; reparent it. Changes appear on both peers with no rebroadcast
+   loop (check the Output panel for repeated application), and a peer edit stays
+   visible on the peer that made it.
 8. **Concurrent edits are deterministic.** Have both users move the same node at
    nearly the same time. The host's accepted order wins; the loser gets a
    conflict/reject notice, not a silent drop.

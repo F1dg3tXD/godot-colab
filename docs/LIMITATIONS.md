@@ -7,8 +7,9 @@ are listed explicitly so nothing here is mistaken for working functionality.
 ## Verification status
 
 - The headless test suite (`addons/godot_collab/tests/run_tests.gd`) covers the
-  protocol framing/validation, invitation codes, path guard, rate limiter, and
-  an ENet loopback handshake/cursor/disconnect flow. It passes (see
+  protocol framing/validation, invitation codes, path guard, rate limiter, an
+  ENet loopback handshake/cursor/disconnect flow, and a two-scene loopback
+  snapshot/host<->peer edit-propagation flow. It passes (see
   [`TESTING.md`](TESTING.md)).
 - The interactive editor behaviours (dock UI, remote cursor drawing,
   `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene editing,
@@ -49,6 +50,17 @@ are listed explicitly so nothing here is mistaken for working functionality.
 - The diff watcher is bounded and best-effort. Very rapid edits or unsupported
   panels may produce changes that are not detected until the next scan or a
   resynchronization.
+- Joining a host-workspace session **mirrors the host scene**: the host sends a
+  snapshot and the peer applies it automatically (unless
+  `collaboration/auto_apply_snapshot` is turned off). This replaces the peer's
+  local scene children with the host's, so unsaved local edits made before
+  joining are discarded by design.
+- A snapshot is sent as a single packet and is capped at
+  `CollabConstants.MAX_PACKET_PAYLOAD` (1 MiB). A scene whose serialized
+  snapshot exceeds that cannot be sent and is reported as an error; snapshots
+  are not chunked across packets.
+- Node scripts are shared as `res://` paths. The script must exist at the same
+  path on each peer; otherwise the node is created without its script.
 - Conflict handling is deterministic (host order + revision) but is not a full
   CRDT/operational-transform system.
 

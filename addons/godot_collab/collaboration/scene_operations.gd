@@ -245,6 +245,9 @@ static func validate_op(op: Variant, resolver: Callable) -> String:
 				return "node class '%s' is not creatable" % node_class
 			if str(d.get("name", "")).length() > 128:
 				return "node name too long"
+			var script: String = str(d.get("script", ""))
+			if not script.is_empty() and (not script.begins_with("res://") or script.contains("..")):
+				return "invalid script path"
 		OP_REMOVE, OP_RENAME, OP_REPARENT, OP_TRANSFORM:
 			if not resolver.is_valid():
 				return "no node resolver"

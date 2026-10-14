@@ -105,7 +105,10 @@ func set_label_visible(value: bool) -> void:
 
 
 func _apply_username() -> void:
-	if _name_label != null:
+	# Only overwrite the label when there is a real name to show; otherwise the
+	# authored placeholder is left untouched so loading the scene in the editor
+	# does not mark it modified.
+	if _name_label != null and not username.is_empty() and _name_label.text != username:
 		_name_label.text = username
 	_update_viewport_height.call_deferred()
 
@@ -124,15 +127,29 @@ func _update_viewport_height() -> void:
 
 
 func _apply_color() -> void:
-	# Duplicate the shared material so each marker can have its own colour.
+	# Only touch the (shared) resources when the desired colour actually differs
+	# from what is already stored. On load the authored colour equals the default
+	# marker colour, so this stays a no-op and does not mark the scene modified.
 	if _sphere != null:
 		var base: Material = _sphere.material_override
 		if base is StandardMaterial3D:
-			var mat: StandardMaterial3D = (base as StandardMaterial3D).duplicate()
-			mat.albedo_color = marker_color
-			mat.emission = marker_color
-			_sphere.material_override = mat
+			var existing: StandardMaterial3D = base as StandardMaterial3D
+			if not _material_matches(existing, marker_color):
+				var mat: StandardMaterial3D = existing.duplicate() as StandardMaterial3D
+				mat.albedo_color = marker_color
+				mat.emission = marker_color
+				_sphere.material_override = mat
 	if _name_label != null and _name_label.label_settings != null:
-		var settings: LabelSettings = _name_label.label_settings.duplicate()
-		settings.font_color = marker_color
-		_name_label.label_settings = settings
+		var current: LabelSettings = _name_label.label_settings
+		if not current.font_color.is_equal_approx(marker_color):
+			var settings: LabelSettings = current.duplicate() as LabelSettings
+			settings.font_color = marker_color
+			_name_label.label_settings = settings
+
+
+func _material_matches(mat: StandardMaterial3D, color: Color) -> bool:
+	return (
+		mat.albedo_color.is_equal_approx(color)
+		and mat.emission_enabled
+		and mat.emission.is_equal_approx(color)
+	)

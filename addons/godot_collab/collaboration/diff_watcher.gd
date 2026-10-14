@@ -161,12 +161,23 @@ func _new_node_op(node: Node, entry: Dictionary) -> Dictionary:
 		local_peer_id, _next_op_id(), scene_id, base_revision,
 		parent_id, node.get_class(), node.name, node_id if not is_host else -1)
 	op["node_id"] = node_id
+	op["script"] = _script_path(node)
 	if entry["is_node3d"]:
 		var t: Transform3D = entry["transform"]
 		op["position"] = t.origin
 		op["rotation"] = t.basis.get_euler()
 		op["scale"] = t.basis.get_scale()
 	return op
+
+
+func _script_path(node: Node) -> String:
+	var script: Script = node.get_script()
+	if script == null:
+		return ""
+	var path: String = script.resource_path
+	if path.is_empty() or not path.begins_with("res://") or path.contains(".."):
+		return ""
+	return path
 
 
 func _compare(old: Dictionary, new_entry: Dictionary, ops: Array) -> void:

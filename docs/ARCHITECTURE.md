@@ -165,11 +165,23 @@ it reports a conflict/error to the dock.
 
 ### Resynchronization
 
-When a peer's state cannot be reconciled it can request a snapshot. The host
-builds a `SNAPSHOT_RESPONSE` for the current scene; the receiving side holds it
-as a *pending* snapshot and requires explicit confirmation from the user before
-applying (`apply_pending_snapshot` / `discard_pending_snapshot`), so a bad or
-stale snapshot cannot silently clobber local work.
+The host pushes a snapshot of the current edited scene to a peer as soon as it
+is admitted (`peer_ready`), so a joining peer mirrors exactly what the host has.
+A snapshot carries every node's stable id, parent id, class, name, `res://`
+script path, `Node3D` transform, and whitelisted properties. Applying it
+replaces the local children of the edited root with the host's tree, so both
+peers converge on the same node ids and structure.
+
+A peer may also request a snapshot at any time (`SNAPSHOT_REQUEST`); the host
+answers with `SNAPSHOT_RESPONSE`. When `auto_apply_snapshot` is enabled (the
+default in host-workspace mode) the peer applies an incoming snapshot
+immediately, because the host owns the authoritative scene. Turning it off makes
+the receiver hold the snapshot as *pending* until explicitly applied
+(`apply_pending_snapshot` / `discard_pending_snapshot`); a snapshot that cannot
+be applied (no scene open, or a different scene) is kept pending and reported
+rather than cleared. Rejected operations are reported to the dock but no longer
+force a snapshot on their own, so a peer's local-only edit (for example an
+unsupported node type) is never silently wiped.
 
 ## Presence and remote cursors
 

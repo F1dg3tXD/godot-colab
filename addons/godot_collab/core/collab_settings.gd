@@ -22,6 +22,7 @@ const KEY_CURSOR_SIZE_KEY: String = SETTING_ROOT + "/cursors/marker_size"
 const KEY_CURSOR_DEPTH_KEY: String = SETTING_ROOT + "/cursors/marker_depth"
 const KEY_AUTOSAVE: String = SETTING_ROOT + "/saving/auto_save"
 const KEY_AUTOSAVE_DELAY: String = SETTING_ROOT + "/saving/auto_save_delay"
+const KEY_AUTO_APPLY_SNAPSHOT: String = SETTING_ROOT + "/collaboration/auto_apply_snapshot"
 const KEY_TRANSFER_DIR: String = SETTING_ROOT + "/transfer/download_dir"
 const KEY_MAX_FILE_MB: String = SETTING_ROOT + "/transfer/max_file_mb"
 const KEY_MAX_TOTAL_MB: String = SETTING_ROOT + "/transfer/max_total_mb"
@@ -52,6 +53,7 @@ func register_defaults() -> void:
 	_register(KEY_CURSOR_DEPTH_KEY, 12.0, TYPE_FLOAT, "Distance along the remote camera ray (world units) at which the marker is drawn.", 0.1, 500.0)
 	_register(KEY_AUTOSAVE, false, TYPE_BOOL, "Automatically save the shared scene after inactivity.")
 	_register(KEY_AUTOSAVE_DELAY, 8.0, TYPE_FLOAT, "Seconds of inactivity before auto-saving the shared scene.", 2.0, 120.0)
+	_register(KEY_AUTO_APPLY_SNAPSHOT, true, TYPE_BOOL, "Automatically mirror the host scene when joining a host-workspace session.")
 	_register(KEY_TRANSFER_DIR, "", TYPE_STRING, "Directory used for downloaded project snapshots.")
 	_register(KEY_MAX_FILE_MB, 64, TYPE_INT, "Maximum size of a single transferred file (MiB).", 1, 4096)
 	_register(KEY_MAX_TOTAL_MB, 512, TYPE_INT, "Maximum total size of a project download (MiB).", 1, 32768)

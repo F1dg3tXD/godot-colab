@@ -23,9 +23,10 @@ static func normalize_relative(path: String) -> String:
 	var p: String = path.strip_edges()
 	if p.is_empty() or p.length() > 512:
 		return ""
-	# A literal "\u0000" escape in source is rejected by the script parser, so
-	# build the NUL string at runtime with String.chr(0) instead.
-	if p.find(String.chr(0)) != -1:
+	# A literal "\u0000" escape in source is rejected by the script parser, and
+	# constructing a NUL string with String.chr(0) triggers engine warnings, so
+	# scan the UTF-8 bytes for an embedded NUL instead.
+	if p.to_utf8_buffer().has(0):
 		return ""
 	if p.contains("\\"):
 		return ""

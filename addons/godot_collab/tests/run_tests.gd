@@ -29,7 +29,18 @@ func _init() -> void:
 	_test_path_guard()
 	_test_rate_limiter()
 	_test_loopback_session()
+	_test_scene_sync_loopback()
+	# The marker test needs a live frame so the node's ready/deferred calls run.
+	_run_marker_test_then_finish()
 
+
+func _run_marker_test_then_finish() -> void:
+	await process_frame
+	_test_marker_visuals()
+	_finish()
+
+
+func _finish() -> void:
 	print("")
 	print("%d checks, %d failures" % [_checks, _failures.size()])
 	if _failures.is_empty():
@@ -115,6 +126,49 @@ func _test_rate_limiter() -> void:
 	_check(allowed == 3, "burst limited to capacity (got %d)" % allowed)
 
 
+func _test_marker_visuals() -> void:
+	print("[marker visuals]")
+	var packed: PackedScene = load("res://addons/godot_collab/assets/editorNodeVis.tscn") as PackedScene
+	_check(packed != null, "marker scene loads")
+	if packed == null:
+		return
+	var marker: CollabUserMarker = packed.instantiate() as CollabUserMarker
+	_check(marker != null, "marker scene instantiates as CollabUserMarker")
+	if marker == null:
+		return
+	root.add_child(marker)
+	_check(marker.is_node_ready(), "marker runs _ready when added to the tree")
+
+	var label: Label = marker.find_child("$user", true, false) as Label
+	var sphere: CSGSphere3D = marker.get_node_or_null("CSGSphere3D") as CSGSphere3D
+	_check(label != null, "marker exposes its username label")
+	_check(sphere != null, "marker exposes its sphere")
+
+	# Applying the default colour must be a no-op so loading the scene in the
+	# editor does not duplicate resources / mark it modified.
+	var original_material: Material = null
+	if sphere != null:
+		original_material = sphere.material_override
+	marker.marker_color = Color(1, 0, 0, 0.6)
+	_check(
+		sphere != null and sphere.material_override == original_material,
+		"re-applying the default colour keeps the shared material"
+	)
+
+	var blue := Color(0.2, 0.4, 1.0, 0.8)
+	marker.username = "Alice"
+	marker.marker_color = blue
+	_check(label != null and label.text == "Alice", "username is applied to the label")
+	if label != null and label.label_settings != null:
+		_check(label.label_settings.font_color.is_equal_approx(blue), "marker colour is applied to the label")
+	if sphere != null and sphere.material_override is StandardMaterial3D:
+		var mat: StandardMaterial3D = sphere.material_override as StandardMaterial3D
+		_check(mat.albedo_color.is_equal_approx(blue) and mat.emission.is_equal_approx(blue), "marker colour is applied to the material")
+
+	root.remove_child(marker)
+	marker.free()
+
+
 func _test_loopback_session() -> void:
 	print("[loopback session]")
 	var logs := CollabLog.new()
@@ -188,6 +242,109 @@ func _test_loopback_session() -> void:
 	_check(bool(state["host_stopped"]), "client saw the host disconnect")
 
 	client.stop("cleanup")
+	host.free()
+	client.free()
+	host_manager.free()
+	client_manager.free()
+
+
+## Drives two in-process peers until [param done] returns true or the timeout
+## elapses. Returns true if the condition was met.
+func _pump(host: CollabSessionCoordinator, client: CollabSessionCoordinator, host_sync: CollabSceneSyncService, client_sync: CollabSceneSyncService, timeout_ms: int, done: Callable) -> bool:
+	var deadline: int = Time.get_ticks_msec() + timeout_ms
+	while Time.get_ticks_msec() < deadline:
+		host.poll()
+		client.poll()
+		host_sync.poll()
+		client_sync.poll()
+		if done.call():
+			return true
+		OS.delay_msec(5)
+	return bool(done.call())
+
+
+func _test_scene_sync_loopback() -> void:
+	print("[scene sync loopback]")
+	var logs := CollabLog.new()
+	var port: int = 45978
+
+	# Host scene: Root -> Box at (1,2,3).
+	var host_root := Node3D.new()
+	host_root.name = "Root"
+	var host_box := Node3D.new()
+	host_box.name = "Box"
+	host_box.position = Vector3(1.0, 2.0, 3.0)
+	host_root.add_child(host_box)
+
+	# Client starts with a different scene content that the host snapshot must replace.
+	var client_root := Node3D.new()
+	client_root.name = "Root"
+	var client_stale := Node3D.new()
+	client_stale.name = "Stale"
+	client_root.add_child(client_stale)
+
+	var host_manager := CollabSessionManager.new(logs)
+	var host := CollabSessionCoordinator.new()
+	host.setup(host_manager, logs)
+	var client_manager := CollabSessionManager.new(logs)
+	var client := CollabSessionCoordinator.new()
+	client.setup(client_manager, logs)
+
+	host.get_project_id = func() -> String: return "proj"
+	host.get_scene_id = func() -> String: return "res://scene.tscn"
+	host.get_username = func() -> String: return "host"
+	client.get_project_id = func() -> String: return "proj"
+	client.get_scene_id = func() -> String: return "res://scene.tscn"
+	client.get_username = func() -> String: return "peer"
+
+	var get_host_root := func() -> Node: return host_root
+	var get_client_root := func() -> Node: return client_root
+	var noop := func() -> void: pass
+	var host_sync := CollabSceneSyncService.new()
+	host_sync.setup(host, logs, {"get_edited_root": get_host_root, "mark_unsaved": noop})
+	var client_sync := CollabSceneSyncService.new()
+	client_sync.setup(client, logs, {"get_edited_root": get_client_root, "mark_unsaved": noop})
+	client_sync.auto_apply_snapshot = true
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "sync host starts (%s)" % error_string(err))
+	host_sync.attach_scene(host_root, "res://scene.tscn")
+	client_sync.attach_scene(client_root, "res://scene.tscn")
+	err = client.join("127.0.0.1", port, "")
+	_check(err == OK, "sync client join starts (%s)" % error_string(err))
+
+	# The host sends its scene on peer_ready; the client must auto-apply it.
+	var synced: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		return client_root.get_node_or_null("Box") != null)
+	_check(synced, "client received the host scene snapshot")
+	_check(client_root.get_node_or_null("Stale") == null, "client's previous content replaced by snapshot")
+
+	var client_box: Node3D = client_root.get_node_or_null("Box") as Node3D
+	_check(client_box != null and client_box.position.is_equal_approx(Vector3(1.0, 2.0, 3.0)), "snapshot preserved the node transform")
+
+	# A peer edit must reach the host and remain visible on the peer.
+	if client_box != null:
+		client_box.position = Vector3(4.0, 5.0, 6.0)
+	var applied: bool = _pump(host, client, host_sync, client_sync, 4000, func() -> bool:
+		var hb: Node3D = host_root.get_node_or_null("Box") as Node3D
+		return hb != null and hb.position.is_equal_approx(Vector3(4.0, 5.0, 6.0)))
+	var host_box_after: Node3D = host_root.get_node_or_null("Box") as Node3D
+	_check(applied, "host applied the peer transform edit (got %s)" % str(host_box_after.position if host_box_after != null else "missing"))
+	_check(client_box != null and client_box.position.is_equal_approx(Vector3(4.0, 5.0, 6.0)), "peer edit stayed visible locally")
+
+	# A host edit must reach the peer.
+	if host_box_after != null:
+		host_box_after.position = Vector3(7.0, 8.0, 9.0)
+	var host_propagated: bool = _pump(host, client, host_sync, client_sync, 4000, func() -> bool:
+		return client_box != null and client_box.position.is_equal_approx(Vector3(7.0, 8.0, 9.0)))
+	_check(host_propagated, "host edit propagated to the peer")
+
+	client_sync.detach_scene()
+	host_sync.detach_scene()
+	client.stop("cleanup")
+	host.stop("cleanup")
+	host_root.free()
+	client_root.free()
 	host.free()
 	client.free()
 	host_manager.free()
