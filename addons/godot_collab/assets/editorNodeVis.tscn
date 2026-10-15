@@ -40,14 +40,12 @@ rings = 16
 
 [node name="CSGCylinder3D" type="CSGCylinder3D" parent="CSGSphere3D" unique_id=1570029731]
 transform = Transform3D(1, 0, 0, 0, -4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0.6926599)
-visible = false
 radius = 0.05
 height = 0.5
 sides = 16
 
 [node name="CSGPolygon3D" type="CSGPolygon3D" parent="CSGSphere3D/CSGCylinder3D" unique_id=374779098]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.2212109, -9.669439e-09)
-visible = false
 polygon = PackedVector2Array(0, 0, 0, 0.3, 0.1, 0)
 mode = 1
 spin_degrees = 360.0
@@ -69,6 +67,8 @@ render_target_update_mode = 4
 anchors_preset = 15
 anchor_right = 1.0
 anchor_bottom = 1.0
+offset_right = -32.0
+offset_bottom = -30.0
 grow_horizontal = 2
 grow_vertical = 2
 
