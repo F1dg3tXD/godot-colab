@@ -28,15 +28,23 @@ structured, validated operation protocol.
   colours, interpolation, rate limiting, and stale-state removal.
 - Live 3D `editorNodeVis` markers for each remote participant, so collaborators
   see each other moving in the editor's 3D view in real time.
-- Host-authoritative scene operations: node create/remove/rename/reparent and
-  `Node3D` transform plus a restricted set of Inspector properties.
+- Host-authoritative scene operations: node create/remove/rename/reparent,
+  `Node3D` transform, and the **general Inspector-property set** (servo-derived
+  from `get_property_list()`, not a fixed whitelist), both host→client and
+  client→host.
 - **Multi-scene collaboration.** Every open scene is tracked independently, so
   collaborators can work in different scenes at once and the host switching tabs
   never reverts anyone's edits. Changes to a scene the host is not viewing are
   applied and persisted on the host.
+- **Source-file sync.** Changed scripts, text resources and `project.godot` are
+  relayed to the host and to other peers (generated caches and, deliberately,
+  `addons/` are excluded). Files are written to disk only, never executed.
 - **Workspace authoring.** Collaborators can ask the host to create a new scene
   or add a text project file; the host validates it (path/size/extension) and
   distributes a local copy to every peer.
+- **Rejoin-safe node identity.** Node ids are host-authoritative only; a client
+  that restarts onto a stale scene reconciles its ids to the host's on join, so
+  its edits can never hit the wrong node.
 - Explicit **Save Shared Scene** (persists remote edits, then saves the focused
   scene) and optional auto-save on the host.
 - Host-owned project snapshot download (chunked, checksummed, path-safe) that
@@ -73,7 +81,10 @@ peers, and UPnP mapping.
 4. Move the mouse over editor **A**'s 3D viewport; a coloured cursor and username
    appear in editor **B**'s viewport (and vice-versa).
 5. With a scene open on both sides, edit a `Node3D` transform (via the Inspector
-   or the 3D gizmo). The change is applied to the host's scene and broadcast.
+   or the 3D gizmo) or any other Inspector property. The change is applied to the
+   host's scene and broadcast; client edits reach the host too. Changes to source
+   files (scripts, `project.godot`) are relayed as well — but never edit files
+   under `addons/` while a session is live.
 
 For LAN testing, use the host's LAN IP in a direct invitation. For internet
 testing, run the rendezvous service and/or configure UPnP or manual port
@@ -99,7 +110,7 @@ addons/godot_collab/
   network/                     wire protocol, ENet session manager, participants
   session/                     session coordinator, invite codes, rendezvous, UPnP, connectivity
   presence/                    local/remote cursor sampling and overlay drawing
-  collaboration/               per-scene sync contexts, scene ops, node-id mapping, diff watcher, save + workspace authoring
+  collaboration/               per-scene sync contexts, scene ops, node-id mapping, diff watcher, save, workspace authoring + source-file sync
   project_transfer/            project manifest + chunked transfer manager
   security/                    path validation + rate limiting
   ui/                          editor dock

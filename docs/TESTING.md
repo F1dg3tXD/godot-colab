@@ -18,16 +18,26 @@ cd /path/to/godot-colab
   `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/`SCENE_LIST`), invitation
   code encode/decode, path guard (traversal/absolute/symlink), rate limiter,
   node-id allocation (positive authoritative ids, `-1` sentinel avoidance, no id
-  reuse after `clear()`), marker scene instantiation with username/colour
+  reuse after `clear()`), general property value encode/decode (vectors, rects,
+  transforms, AABBs, `StringName`, arrays, dictionaries; refusal of containers
+  holding live `Object`s), `is_property_syncable`/`collect_syncable_props`
+  behaviour (general properties accepted, `name`/`script`/`transform` reserved),
+  source-file path predicates and baseline scanning (`addons/`, `.godot/`,
+  `.git/` excluded; scenes not treated as source files), node-id reconciliation
+  against a host snapshot, marker scene instantiation with username/colour
   application and no-op default colour, a `CollabMarkerManager` check (marker
   created for a remote cursor, parented into the viewport container, removed when
   the cursor disappears or the peer is in another scene), an ENet loopback
   host/client handshake with cursor relay and host-disconnect detection, a
   two-scene loopback test where a host scene is snapshotted to a joining peer and
   host/peer create/remove/transform edits propagate both ways without id
-  collisions or duplicated nodes, and a **multi-scene isolation** test where the
-  host is focused on scene B while a client edits scene A (the edit must reach A,
-  not B).
+  collisions or duplicated nodes, a **general inspector-property** loopback test
+  (`editor_description`/`process_priority` host→client, `visible` client→host),
+  a **rejoin-desync** test (a client with a stale local scene joins, is
+  snapshotted, and its later edits target the correct node; then it reconnects
+  with a fresh client and is re-keyed to host ids), and a **multi-scene
+  isolation** test where the host is focused on scene B while a client edits
+  scene A (the edit must reach A, not B).
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -109,6 +119,22 @@ instances, enable **Godot Collab** in each, and run through the checks:
     there (it must not be reverted by the tab switch). Close A on the host, edit
     A again from the client, and verify the host writes it to disk; reopen A and
     confirm the change is present.
+8a. **General property sync.** Change a property that is not a transform or a
+    "famous" one — e.g. set `process_priority`, `editor_description`,
+    `visible`, `modulate`, or a `CollisionShape3D`'s `shape` size — on one peer
+    and confirm it appears on the other. Change a property from the **client**
+    and confirm it reaches the host (client → host must work too).
+8b. **Source file sync.** With the session running, edit a script
+    (`res://scripts/*.gd`) on the client and save it. Confirm the host's file
+    contents change on disk (and, if the editor reloads it, the host reflects
+    it). Then edit `project.godot` on the host and confirm the client receives
+    it. Confirm that editing anything under `addons/` is **not** relayed, and
+    that the dock shows the "do not edit addons while a session is live"
+    warning.
+8c. **Rejoin after a crash.** With the session running, close the client editor
+    (kill it). Reopen the client project and join again. Toggle a node's
+    visibility / move a node from the client and confirm it affects the
+    **same** node on the host (no phantom node, no wrong-node edit).
 9b. **Workspace authoring.** From the client dock, use **New scene...** to
     create `res://scenes/test_from_client.tscn` and **Add file...** to add a
     small `.gd` file. Confirm both peers receive the files (the client's local

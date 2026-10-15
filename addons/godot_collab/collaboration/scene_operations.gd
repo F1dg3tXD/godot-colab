@@ -30,40 +30,62 @@ const CREATABLE_CLASSES: Array[String] = [
 	"Label", "Panel", "Button", "CanvasLayer",
 ]
 
-## A restricted inspector property whitelist. Only plain, serializable values
-## and resource *paths* are accepted.
-const PROPERTY_WHITELIST: Dictionary = {
-	"Node3D": ["position", "rotation", "scale", "visible"],
-	"Node": ["name"],
-	"CanvasItem": ["visible", "modulate", "self_modulate"],
-	"MeshInstance3D": ["mesh", "cast_shadow", "material_override", "material_overlay"],
-	"Camera3D": ["fov", "near", "far", "projection", "current", "size", "keep_aspect"],
-	"Light3D": ["light_color", "light_energy", "shadow_enabled", "light_bake_mode"],
-	"DirectionalLight3D": ["directional_shadow_max_distance", "sky_mode"],
-	"CollisionShape3D": ["shape", "disabled"],
-	"Area3D": ["monitoring", "monitorable", "gravity"],
-	"RigidBody3D": ["mass", "gravity_scale", "linear_velocity", "angular_velocity"],
-	"CharacterBody3D": ["motion_mode", "up_direction"],
-	"Label3D": ["text", "font_size", "modulate", "outline_size", "pixel_size"],
-	"Label": ["text", "horizontal_alignment", "vertical_alignment"],
-	"Control": ["position", "size", "size_flags_horizontal", "size_flags_vertical"],
-	"GridMap": ["cell_size", "mesh_library"],
-	"MultiMeshInstance3D": ["multimesh"],
-}
+## Properties that are never synchronised as plain property operations. Most
+## are handled by a dedicated operation (name, transform) or would let a peer
+## change node identity/behaviour in unsafe ways (script, owner).
+const RESERVED_PROPERTIES: Array[String] = [
+	"name", "script", "owner", "transform", "global_transform",
+]
+
+## Node3D exposes both `transform` (stored) and the derived editor-only
+## `position`/`rotation`/`scale`. All of them are covered by the dedicated
+## transform operation, so they are skipped here to avoid duplicate traffic.
+const NODE3D_TRANSFORM_PROPERTIES: Array[String] = [
+	"position", "rotation", "rotation_degrees", "quaternion", "scale", "basis",
+]
 
 ## Value kinds sendable over the wire.
 const VALUE_NULL: String = "null"
 const VALUE_FLOAT: String = "float"
 const VALUE_INT: String = "int"
 const VALUE_BOOL: String = "bool"
+const VALUE_VECTOR2: String = "vector2"
+const VALUE_VECTOR2I: String = "vector2i"
 const VALUE_VECTOR3: String = "vector3"
+const VALUE_VECTOR3I: String = "vector3i"
+const VALUE_VECTOR4: String = "vector4"
+const VALUE_VECTOR4I: String = "vector4i"
+const VALUE_QUATERNION: String = "quaternion"
+const VALUE_BASIS: String = "basis"
+const VALUE_TRANSFORM2D: String = "transform2d"
+const VALUE_TRANSFORM3D: String = "transform3d"
+const VALUE_RECT2: String = "rect2"
+const VALUE_RECT2I: String = "rect2i"
+const VALUE_PLANE: String = "plane"
+const VALUE_AABB: String = "aabb"
+const VALUE_PROJECTION: String = "projection"
 const VALUE_COLOR: String = "color"
 const VALUE_STRING: String = "string"
+const VALUE_STRING_NAME: String = "string_name"
 const VALUE_NODE_PATH: String = "node_path"
+const VALUE_ARRAY: String = "array"
+const VALUE_DICTIONARY: String = "dictionary"
+const VALUE_PACKED_INT32: String = "packed_int32"
+const VALUE_PACKED_INT64: String = "packed_int64"
+const VALUE_PACKED_FLOAT32: String = "packed_float32"
+const VALUE_PACKED_FLOAT64: String = "packed_float64"
+const VALUE_PACKED_STRING: String = "packed_string"
+const VALUE_PACKED_VECTOR2: String = "packed_vector2"
+const VALUE_PACKED_VECTOR3: String = "packed_vector3"
+const VALUE_PACKED_COLOR: String = "packed_color"
 const VALUE_RESOURCE: String = "resource_path"
 const VALUE_UNSUPPORTED: String = "unsupported"
 
 const MAX_STRING_VALUE: int = 8192
+## Maximum number of elements accepted in an array/dictionary/packed-array
+## property. Keeps a malicious peer from forcing large allocations.
+const MAX_CONTAINER_ELEMENTS: int = 4096
+const MAX_CONTAINER_DEPTH: int = 6
 
 
 static func is_supported_op(type: String) -> bool:
@@ -74,19 +96,53 @@ static func is_creatable(node_class: String) -> bool:
 	return CREATABLE_CLASSES.has(node_class)
 
 
-## True when [param property] is allowed for [param node_class] (checked
-## against the class and its ancestors present in the whitelist).
-static func is_property_allowed(node: Object, property: String) -> bool:
-	if node == null:
+## True when [param property] may be synchronised as an ordinary property of
+## [param node]. This is deliberately general (any stored/editable property
+## whose value is safely serialisable) but refuses names that would change node
+## identity, attach code, or address sub-resources.
+static func is_property_syncable(node: Object, property: String) -> bool:
+	if node == null or not _is_syncable_name(node, property):
 		return false
-	var check_class: String = node.get_class()
-	while true:
-		if PROPERTY_WHITELIST.has(check_class) and (PROPERTY_WHITELIST[check_class] as Array).has(property):
-			return true
-		check_class = _parent_class(check_class)
-		if check_class.is_empty() or check_class == "Object":
-			break
+	for info in node.get_property_list():
+		if str(info.get("name", "")) != property:
+			continue
+		var usage: int = int(info.get("usage", 0))
+		if (usage & PROPERTY_USAGE_INTERNAL) != 0:
+			return false
+		return (usage & PROPERTY_USAGE_STORAGE) != 0 or (usage & PROPERTY_USAGE_EDITOR) != 0
 	return false
+
+
+## Collects every safe, serialisable property of [param node] as
+## { property: { kind, value } }. Used for both diffing and snapshots so the two
+## paths always agree.
+static func collect_syncable_props(node: Node) -> Dictionary:
+	var out: Dictionary = {}
+	if node == null:
+		return out
+	for info in node.get_property_list():
+		var prop: String = str(info.get("name", ""))
+		if not _is_syncable_name(node, prop):
+			continue
+		var usage: int = int(info.get("usage", 0))
+		if (usage & PROPERTY_USAGE_INTERNAL) != 0:
+			continue
+		if (usage & PROPERTY_USAGE_STORAGE) == 0 and (usage & PROPERTY_USAGE_EDITOR) == 0:
+			continue
+		var encoded: Dictionary = encode_value(node.get(prop))
+		if encoded["kind"] != VALUE_UNSUPPORTED:
+			out[prop] = encoded
+	return out
+
+
+static func _is_syncable_name(node: Object, property: String) -> bool:
+	if property.is_empty() or property.begins_with("_") or property.contains("/"):
+		return false
+	if RESERVED_PROPERTIES.has(property):
+		return false
+	if node is Node3D and NODE3D_TRANSFORM_PROPERTIES.has(property):
+		return false
+	return true
 
 
 ## Converts a Godot value to a safe wire representation. Returns a dictionary
@@ -101,15 +157,46 @@ static func encode_value(value: Variant) -> Dictionary:
 			return {"kind": VALUE_INT, "value": value}
 		TYPE_FLOAT:
 			return {"kind": VALUE_FLOAT, "value": value}
-		TYPE_STRING, TYPE_STRING_NAME:
-			var s: String = str(value)
+		TYPE_STRING:
+			var s: String = value
 			if s.length() > MAX_STRING_VALUE:
-				return {"kind": VALUE_UNSUPPORTED, "value": null}
+				return _unsupported()
 			return {"kind": VALUE_STRING, "value": s}
+		TYPE_STRING_NAME:
+			var sn: String = str(value)
+			if sn.length() > MAX_STRING_VALUE:
+				return _unsupported()
+			return {"kind": VALUE_STRING_NAME, "value": sn}
+		TYPE_VECTOR2:
+			return {"kind": VALUE_VECTOR2, "value": value}
+		TYPE_VECTOR2I:
+			return {"kind": VALUE_VECTOR2I, "value": value}
 		TYPE_VECTOR3:
 			return {"kind": VALUE_VECTOR3, "value": value}
-		TYPE_VECTOR2:
-			return {"kind": "vector2", "value": value}
+		TYPE_VECTOR3I:
+			return {"kind": VALUE_VECTOR3I, "value": value}
+		TYPE_VECTOR4:
+			return {"kind": VALUE_VECTOR4, "value": value}
+		TYPE_VECTOR4I:
+			return {"kind": VALUE_VECTOR4I, "value": value}
+		TYPE_QUATERNION:
+			return {"kind": VALUE_QUATERNION, "value": value}
+		TYPE_BASIS:
+			return {"kind": VALUE_BASIS, "value": value}
+		TYPE_TRANSFORM2D:
+			return {"kind": VALUE_TRANSFORM2D, "value": value}
+		TYPE_TRANSFORM3D:
+			return {"kind": VALUE_TRANSFORM3D, "value": value}
+		TYPE_RECT2:
+			return {"kind": VALUE_RECT2, "value": value}
+		TYPE_RECT2I:
+			return {"kind": VALUE_RECT2I, "value": value}
+		TYPE_PLANE:
+			return {"kind": VALUE_PLANE, "value": value}
+		TYPE_AABB:
+			return {"kind": VALUE_AABB, "value": value}
+		TYPE_PROJECTION:
+			return {"kind": VALUE_PROJECTION, "value": value}
 		TYPE_COLOR:
 			return {"kind": VALUE_COLOR, "value": value}
 		TYPE_NODE_PATH:
@@ -119,9 +206,33 @@ static func encode_value(value: Variant) -> Dictionary:
 			if resource != null and not resource.resource_path.is_empty():
 				# Only send the path; the client loads it from its own copy.
 				return {"kind": VALUE_RESOURCE, "value": resource.resource_path}
-			return {"kind": VALUE_UNSUPPORTED, "value": null}
+			return _unsupported()
+		TYPE_ARRAY:
+			if not _is_plain_container(value, 0):
+				return _unsupported()
+			return {"kind": VALUE_ARRAY, "value": value}
+		TYPE_DICTIONARY:
+			if not _is_plain_container(value, 0):
+				return _unsupported()
+			return {"kind": VALUE_DICTIONARY, "value": value}
+		TYPE_PACKED_INT32_ARRAY:
+			return _packed(value, VALUE_PACKED_INT32)
+		TYPE_PACKED_INT64_ARRAY:
+			return _packed(value, VALUE_PACKED_INT64)
+		TYPE_PACKED_FLOAT32_ARRAY:
+			return _packed(value, VALUE_PACKED_FLOAT32)
+		TYPE_PACKED_FLOAT64_ARRAY:
+			return _packed(value, VALUE_PACKED_FLOAT64)
+		TYPE_PACKED_STRING_ARRAY:
+			return _packed(value, VALUE_PACKED_STRING)
+		TYPE_PACKED_VECTOR2_ARRAY:
+			return _packed(value, VALUE_PACKED_VECTOR2)
+		TYPE_PACKED_VECTOR3_ARRAY:
+			return _packed(value, VALUE_PACKED_VECTOR3)
+		TYPE_PACKED_COLOR_ARRAY:
+			return _packed(value, VALUE_PACKED_COLOR)
 		_:
-			return {"kind": VALUE_UNSUPPORTED, "value": null}
+			return _unsupported()
 
 
 static func is_encodable(value: Variant) -> bool:
@@ -142,14 +253,62 @@ static func decode_value(kind: String, value: Variant, fallback: Variant = null)
 			return float(value)
 		VALUE_STRING:
 			return str(value)
+		VALUE_STRING_NAME:
+			return StringName(str(value))
+		VALUE_VECTOR2:
+			return value if typeof(value) == TYPE_VECTOR2 else Vector2.ZERO
+		VALUE_VECTOR2I:
+			return value if typeof(value) == TYPE_VECTOR2I else Vector2i.ZERO
 		VALUE_VECTOR3:
 			return value if typeof(value) == TYPE_VECTOR3 else Vector3.ZERO
-		"vector2":
-			return value if typeof(value) == TYPE_VECTOR2 else Vector2.ZERO
+		VALUE_VECTOR3I:
+			return value if typeof(value) == TYPE_VECTOR3I else Vector3i.ZERO
+		VALUE_VECTOR4:
+			return value if typeof(value) == TYPE_VECTOR4 else Vector4()
+		VALUE_VECTOR4I:
+			return value if typeof(value) == TYPE_VECTOR4I else Vector4i()
+		VALUE_QUATERNION:
+			return value if typeof(value) == TYPE_QUATERNION else Quaternion()
+		VALUE_BASIS:
+			return value if typeof(value) == TYPE_BASIS else Basis()
+		VALUE_TRANSFORM2D:
+			return value if typeof(value) == TYPE_TRANSFORM2D else Transform2D()
+		VALUE_TRANSFORM3D:
+			return value if typeof(value) == TYPE_TRANSFORM3D else Transform3D()
+		VALUE_RECT2:
+			return value if typeof(value) == TYPE_RECT2 else Rect2()
+		VALUE_RECT2I:
+			return value if typeof(value) == TYPE_RECT2I else Rect2i()
+		VALUE_PLANE:
+			return value if typeof(value) == TYPE_PLANE else Plane()
+		VALUE_AABB:
+			return value if typeof(value) == TYPE_AABB else AABB()
+		VALUE_PROJECTION:
+			return value if typeof(value) == TYPE_PROJECTION else Projection()
 		VALUE_COLOR:
 			return value if typeof(value) == TYPE_COLOR else Color.WHITE
 		VALUE_NODE_PATH:
 			return NodePath(str(value))
+		VALUE_ARRAY:
+			return value if typeof(value) == TYPE_ARRAY else []
+		VALUE_DICTIONARY:
+			return value if typeof(value) == TYPE_DICTIONARY else {}
+		VALUE_PACKED_INT32:
+			return value if typeof(value) == TYPE_PACKED_INT32_ARRAY else PackedInt32Array()
+		VALUE_PACKED_INT64:
+			return value if typeof(value) == TYPE_PACKED_INT64_ARRAY else PackedInt64Array()
+		VALUE_PACKED_FLOAT32:
+			return value if typeof(value) == TYPE_PACKED_FLOAT32_ARRAY else PackedFloat32Array()
+		VALUE_PACKED_FLOAT64:
+			return value if typeof(value) == TYPE_PACKED_FLOAT64_ARRAY else PackedFloat64Array()
+		VALUE_PACKED_STRING:
+			return value if typeof(value) == TYPE_PACKED_STRING_ARRAY else PackedStringArray()
+		VALUE_PACKED_VECTOR2:
+			return value if typeof(value) == TYPE_PACKED_VECTOR2_ARRAY else PackedVector2Array()
+		VALUE_PACKED_VECTOR3:
+			return value if typeof(value) == TYPE_PACKED_VECTOR3_ARRAY else PackedVector3Array()
+		VALUE_PACKED_COLOR:
+			return value if typeof(value) == TYPE_PACKED_COLOR_ARRAY else PackedColorArray()
 		VALUE_RESOURCE:
 			var path: String = str(value)
 			if path.is_empty() or not ResourceLoader.exists(path):
@@ -157,6 +316,77 @@ static func decode_value(kind: String, value: Variant, fallback: Variant = null)
 			return ResourceLoader.load(path)
 		_:
 			return fallback
+
+
+static func _unsupported() -> Dictionary:
+	return {"kind": VALUE_UNSUPPORTED, "value": null}
+
+
+static func _packed(value: Variant, kind: String) -> Dictionary:
+	# Packed arrays are flat, engine-typed buffers; size-check and pass through.
+	if _packed_size(value) > MAX_CONTAINER_ELEMENTS:
+		return _unsupported()
+	return {"kind": kind, "value": value}
+
+
+static func _packed_size(value: Variant) -> int:
+	match typeof(value):
+		TYPE_PACKED_INT32_ARRAY:
+			return (value as PackedInt32Array).size()
+		TYPE_PACKED_INT64_ARRAY:
+			return (value as PackedInt64Array).size()
+		TYPE_PACKED_FLOAT32_ARRAY:
+			return (value as PackedFloat32Array).size()
+		TYPE_PACKED_FLOAT64_ARRAY:
+			return (value as PackedFloat64Array).size()
+		TYPE_PACKED_STRING_ARRAY:
+			return (value as PackedStringArray).size()
+		TYPE_PACKED_VECTOR2_ARRAY:
+			return (value as PackedVector2Array).size()
+		TYPE_PACKED_VECTOR3_ARRAY:
+			return (value as PackedVector3Array).size()
+		TYPE_PACKED_COLOR_ARRAY:
+			return (value as PackedColorArray).size()
+	return 0
+
+
+## True when [param value] is a container made only of wire-safe plain data (no
+## objects/resources, bounded size and depth). Such containers are passed
+## through verbatim because the variant encoder already round-trips them.
+static func _is_plain_container(value: Variant, depth: int) -> bool:
+	if depth > MAX_CONTAINER_DEPTH:
+		return false
+	match typeof(value):
+		TYPE_NIL, TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_STRING, TYPE_STRING_NAME, \
+		TYPE_VECTOR2, TYPE_VECTOR2I, TYPE_VECTOR3, TYPE_VECTOR3I, TYPE_VECTOR4, \
+		TYPE_VECTOR4I, TYPE_QUATERNION, TYPE_BASIS, TYPE_TRANSFORM2D, \
+		TYPE_TRANSFORM3D, TYPE_RECT2, TYPE_RECT2I, TYPE_PLANE, TYPE_AABB, \
+		TYPE_PROJECTION, TYPE_COLOR, TYPE_NODE_PATH:
+			return true
+		TYPE_PACKED_INT32_ARRAY, TYPE_PACKED_INT64_ARRAY, TYPE_PACKED_FLOAT32_ARRAY, \
+		TYPE_PACKED_FLOAT64_ARRAY, TYPE_PACKED_STRING_ARRAY, TYPE_PACKED_VECTOR2_ARRAY, \
+		TYPE_PACKED_VECTOR3_ARRAY, TYPE_PACKED_COLOR_ARRAY:
+			return _packed_size(value) <= MAX_CONTAINER_ELEMENTS
+		TYPE_ARRAY:
+			var arr: Array = value
+			if arr.size() > MAX_CONTAINER_ELEMENTS:
+				return false
+			for item in arr:
+				if not _is_plain_container(item, depth + 1):
+					return false
+			return true
+		TYPE_DICTIONARY:
+			var dict: Dictionary = value
+			if dict.size() > MAX_CONTAINER_ELEMENTS:
+				return false
+			for key in dict.keys():
+				if not _is_plain_container(key, depth + 1):
+					return false
+				if not _is_plain_container(dict[key], depth + 1):
+					return false
+			return true
+		_:
+			return false
 
 
 ## Builds a transform operation for a [Node3D].
@@ -259,14 +489,16 @@ static func validate_op(op: Variant, resolver: Callable) -> String:
 			var property: String = str(d.get("property", ""))
 			if property.is_empty() or property.contains("/") or property.begins_with("_"):
 				return "invalid property name"
+			if RESERVED_PROPERTIES.has(property):
+				return "reserved property '%s'" % property
 			var kind: String = str(d.get("value_kind", ""))
 			if kind == VALUE_UNSUPPORTED or kind.is_empty():
 				return "unsupported property value"
+			if not resolver.is_valid():
+				return "no node resolver"
+			if resolver.call(int(d.get("node_id", -1)), true) == null:
+				return "target node %s unknown" % str(d.get("node_id", -1))
 	return ""
-
-
-static func _parent_class(cls: String) -> String:
-	return ClassDB.get_parent_class(cls)
 
 
 ## Returns the operation type taxonomy used by the diff watcher.

@@ -31,6 +31,7 @@ const KEY_MAX_TOTAL_MB: String = SETTING_ROOT + "/transfer/max_total_mb"
 const KEY_APPROVE_JOINS: String = SETTING_ROOT + "/security/approve_joins"
 const KEY_REQUIRE_TOKEN: String = SETTING_ROOT + "/security/require_invite_token"
 const KEY_ALLOW_WORKSPACE_AUTHORING: String = SETTING_ROOT + "/collaboration/allow_workspace_authoring"
+const KEY_FILE_SYNC: String = SETTING_ROOT + "/collaboration/sync_source_files"
 
 var _settings: Object = null # EditorSettings when available, else null.
 var _memory: Dictionary = {}
@@ -65,6 +66,7 @@ func register_defaults() -> void:
 	_register(KEY_APPROVE_JOINS, true, TYPE_BOOL, "Require the host to approve each participant before granting workspace access.")
 	_register(KEY_REQUIRE_TOKEN, true, TYPE_BOOL, "Require the session token embedded in the invitation code. Disable only for trusted LAN testing.")
 	_register(KEY_ALLOW_WORKSPACE_AUTHORING, true, TYPE_BOOL, "Allow collaborators to create scenes and add files to the host workspace.")
+	_register(KEY_FILE_SYNC, true, TYPE_BOOL, "Relay source-file changes (scripts, shaders, resources, project.godot) to the host. Files under addons/ are never synced.")
 
 
 func get_string(key: String, default: String = "") -> String:

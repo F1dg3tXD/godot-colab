@@ -147,13 +147,13 @@ func _ensure_id(node: Node) -> int:
 	var node_id: int = _node_ids.id_for(node)
 	if node_id != -1:
 		return node_id
-	# Only a client that is actively inside a session may allocate temporary
-	# negative ids; those are re-keyed to the host's authoritative id on the
-	# first create echo. Everyone else (the host, and any editor that is not yet
-	# in a session) allocates stable authoritative ids so the id space never
-	# mixes signs for the same scene.
-	var authoritative: bool = is_host or local_peer_id == 0
-	node_id = _node_ids.allocate_id() if authoritative else _node_ids.allocate_temp_id()
+	# Only the host owns the authoritative positive id space. Every non-host,
+	# including an editor that is not yet in a session, uses negative temporary
+	# ids. This guarantees a peer can never emit an operation that resolves to a
+	# *different* node on the host (its ids are re-keyed to the host's on the
+	# first snapshot / create echo), which is what previously caused rejoining
+	# clients to toggle the wrong node.
+	node_id = _node_ids.allocate_id() if is_host else _node_ids.allocate_temp_id()
 	_node_ids.register(node, node_id)
 	return node_id
 
@@ -168,6 +168,7 @@ func _new_node_op(node: Node, entry: Dictionary) -> Dictionary:
 		parent_id, node.get_class(), node.name, node_id if not is_host else -1)
 	op["node_id"] = node_id
 	op["script"] = _script_path(node)
+	op["props"] = entry["props"]
 	if entry["is_node3d"]:
 		var t: Transform3D = entry["transform"]
 		op["position"] = t.origin
@@ -218,27 +219,10 @@ func _compare(old: Dictionary, new_entry: Dictionary, ops: Array) -> void:
 			})
 
 
+## Collects every safe, serialisable property of [param node]. The policy lives
+## in [CollabSceneOperations] so diffing and snapshots always agree.
 func _watched_props(node: Node) -> Dictionary:
-	var out: Dictionary = {}
-	var check_class: String = node.get_class()
-	while not check_class.is_empty() and check_class != "Object":
-		if CollabSceneOperations.PROPERTY_WHITELIST.has(check_class):
-			for prop in CollabSceneOperations.PROPERTY_WHITELIST[check_class]:
-				if _should_skip_prop(prop):
-					continue
-				if not (prop in node):
-					continue
-				var encoded := CollabSceneOperations.encode_value(node.get(prop))
-				if encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
-					continue
-				out[prop] = encoded
-		check_class = ClassDB.get_parent_class(check_class)
-	return out
-
-
-func _should_skip_prop(prop: String) -> bool:
-	# Transform is tracked separately; name is tracked separately.
-	return prop == "name" or prop == "position" or prop == "rotation" or prop == "scale"
+	return CollabSceneOperations.collect_syncable_props(node)
 
 
 func _transform_delta(a: Transform3D, b: Transform3D) -> float:

@@ -42,7 +42,7 @@ someone maintaining the add-on, not at end users.
 | `CollabDiffWatcher` | `collaboration/diff_watcher.gd` | Per-context debounced snapshot/diff watcher for supported editor changes. |
 | `CollabSceneContext` | `collaboration/scene_context.gd` | Per-scene state (root, node-id map, diff watcher, revision, detached/dirty flags). |
 | `CollabSceneSyncService` | `collaboration/scene_sync_service.gd` | Multi-scene operation apply/create/broadcast, scene-scoped snapshots, revision checks, conflict notices, host-side persistence. |
-| `CollabWorkspaceService` | `collaboration/workspace_service.gd` | Host-authoritative scene creation and file authoring + scene listing, with path/size/extension validation. |
+| `CollabWorkspaceService` | `collaboration/workspace_service.gd` | Host-authoritative scene creation, file authoring, scene listing, and the debounced **source-file watcher/sync**, with path/size/extension validation and `addons/` exclusion. |
 | `CollabSaveService` | `collaboration/save_service.gd` | Explicit + auto save of the shared scene on the host. |
 | `CollabProjectManifest` | `project_transfer/project_manifest.gd` | Eligible-file manifest with sizes and checksums. |
 | `CollabTransferManager` | `project_transfer/transfer_manager.gd` | Chunked, checksummed, cancellable snapshot download; safe writes. |
@@ -73,11 +73,12 @@ plugin.gd ──────────────► CollabSessionCoordinator
 ```
 
 `plugin.gd` polls `CollabSessionManager`, `CollabSceneSyncService`,
-`CollabSaveService` and `CollabTransferManager` every editor frame (the
-workspace service is event-driven and needs no poll). Networking
-and UI never call each other directly: the coordinator emits signals that
-`plugin.gd` translates into dock updates, and the dock emits signals that
-`plugin.gd` translates into coordinator calls.
+`CollabSaveService`, `CollabTransferManager` and `CollabWorkspaceService` every
+editor frame. (`CollabWorkspaceService.poll()` runs the debounced source-file
+watcher; workspace *authoring* is event-driven.) Networking and UI never call
+each other directly: the coordinator emits signals that `plugin.gd` translates
+into dock updates, and the dock emits signals that `plugin.gd` translates into
+coordinator calls.
 
 ## Wire protocol
 
@@ -155,24 +156,47 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
   by `CollabNodeIdMap`. Each node-id map is owned by a scene context, so ids are
   scoped to their scene. Operations reference these ids, not paths, so renames
   and reparents do not break references.
-- **Id allocation policy.** Authoritative ids are positive and host-assigned. The
-  editor binds the edited scene when the plugin enables (before any session
-  exists), so the host and any not-yet-connected editor allocate authoritative
-  ids (`CollabDiffWatcher._ensure_id`: `is_host or local_peer_id == 0`). Only a
-  peer that is actively inside a session as a client allocates temporary
-  negative ids; those are re-keyed to the host's authoritative id when the host
-  echoes the accepted create. `CollabNodeIdMap` reserves `-1` as the "no temp
-  id" sentinel and never reuses ids (its counters are monotonic across
+- **Id allocation policy.** Authoritative ids are positive and **host-only**.
+  `CollabDiffWatcher._ensure_id` uses `authoritative = is_host`: only the host
+  ever allocates positive ids. Every non-host — including an editor that has not
+  joined yet, or one that just restarted onto a stale scene — allocates
+  non-authoritative *negative* ids, which are re-keyed to the host's
+  authoritative ids when the host admits the peer and sends a snapshot (see
+  reconciliation below). This is what makes it structurally impossible for a
+  client operation to resolve to a *different* node that happens to share a
+  number with a host node — the class of bug behind the "toggle hit the wrong
+  node after a crash/rejoin" desync. `CollabNodeIdMap` reserves `-1` as the "no
+  temp id" sentinel and never reuses ids (its counters are monotonic across
   `clear()`), so a node created right after a snapshot cannot collide with an id
   that a live node already holds.
+- **Id reconciliation on join.** On session start a client calls
+  `CollabSceneSyncService.request_snapshot()`. When the snapshot arrives and
+  `auto_apply_snapshot` is on, the snapshot is applied (structure replaced,
+  ids adopted). When it is off, `reconcile_ids_from_snapshot()` walks the local
+  tree by node path and **rebinds** matching local nodes to the host's
+  authoritative ids (`_snapshot_paths` / `_reconcile_walk`), returning the number
+  of matched nodes. Either way the client's subsequent operations address the
+  host's nodes, not stale local ones.
+- Supported property operations are **not a fixed whitelist**: the diff watcher
+  and the sync service both derive the syncable set from
+  `CollabSceneOperations.collect_syncable_props(node)`, which filters
+  `get_property_list()` by usage (storable/editor, excluding read-only), drops
+  the reserved names it handles separately (`name`, `owner`, `transform`,
+  `global_transform`, `script`), and only keeps names whose value
+  `encode_value()` can represent. `is_property_syncable()` is the single gate
+  used by both apply paths.
 - `CollabSceneSyncService` converts supported editor changes into structured
   `OPS`. Every operation carries session id, operation id, source peer, scene
   identity, target node id, base revision, operation type, and validated
   arguments.
 - Supported operations: node create (restricted node types), remove, rename,
-  reparent, `Node3D` transform (position/rotation/scale), and a restricted set
-  of common Inspector properties. Resource references are represented by
-  validated resource paths or explicitly supported serialized values.
+  reparent, `Node3D` transform (position/rotation/scale), and the general
+  Inspector-property set described above (encode/decode covers vectors, colors,
+  rects, transforms, planes, AABBs, projections, `NodePath`, `StringName`,
+  bounded arrays/packed arrays/dictionaries, and resource references as
+  validated `res://` paths). `encode_value()` refuses values it cannot represent
+  (for example a live `Object` inside a container) instead of writing a lossy
+  value.
 - The host validates each operation against the target scene's context and
   revision, applies accepted operations to that scene (live root when open,
   detached model otherwise) using editor-safe mechanisms, bumps that scene's
@@ -212,7 +236,7 @@ editor's own save for the focused scene via `CollabSaveService`.
 The host pushes a snapshot of the current edited scene to a peer as soon as it
 is admitted (`peer_ready`), so a joining peer mirrors exactly what the host has.
 A snapshot carries every node's stable id, parent id, class, name, `res://`
-script path, `Node3D` transform, and whitelisted properties. Applying it
+script path, `Node3D` transform, and its syncable properties. Applying it
 replaces the local children of the edited root with the host's tree, so both
 peers converge on the same node ids and structure.
 
@@ -250,6 +274,34 @@ assets are out of scope for this path and belong to project transfer.
 
 Setting `godot_collab/collaboration/allow_workspace_authoring` (default on)
 gates the whole feature; it is always disabled in Git presence mode.
+
+## Source-file sync (host-authoritative)
+
+Scene edits flow through the structured operation stream; ordinary **source
+files** (scripts, text resources, `project.godot`, `export_presets.cfg`) flow
+through a separate, host-authoritative file path in `CollabWorkspaceService` so
+that editing a script on any peer reaches the host and the other peers:
+
+1. On session start, if `godot_collab/collaboration/sync_source_files` is on,
+   `plugin.gd` enables `file_sync_enabled` and calls `prime_file_baseline()`,
+   which records a size+mtime baseline of every eligible file under the approved
+   project root (`_walk_files`, bounded by `FILESYNC_MAX_FILES`).
+2. `poll()` scans at most every `FILESYNC_INTERVAL_MS` (1200 ms). A file whose
+   stat changed is read (capped at `MAX_WORKSPACE_FILE_BYTES`), sent to the host
+   as a `WORKSPACE_REQUEST` ADD_FILE file op, and its baseline is refreshed.
+3. The host validates the path (inside the approved root, not `addons/`, allowed
+   extension, size) and rebroadcasts the canonical bytes with `FILE_APPLY`.
+4. Each receiver writes only inside its project root and refreshes its own
+   baseline so the write is not re-detected as a local change.
+
+Eligibility (`is_source_file`) excludes generated/vendor trees — `.godot/`,
+`.git/`, and **`addons/`**. Excluding `addons/` is a safety requirement: the
+add-on's own scripts run inside the editor, and live-editing them mid-session
+can crash the local editor and any client that receives the relayed bytes. The
+dock also shows an explicit warning when a session starts. Scene files
+(`.tscn`/`.scn`) are deliberately not handled here; they use the operation
+stream. Files are written to disk only and are never imported or executed by the
+add-on.
 
 ## Presence and remote cursors
 
@@ -298,8 +350,8 @@ Preferences are stored under `godot_collab/*` in the editor's `EditorSettings`
 (see `core/collab_settings.gd`): username, default port, max peers, rendezvous
 URL, direct advertise host, UPnP toggle, cursor label/size/depth, auto-save +
 delay, download directory, per-file/total transfer limits, join approval,
-invite-token requirement, and workspace authoring. Session tokens are never
-written to committed project files.
+invite-token requirement, workspace authoring, and source-file sync. Session
+tokens are never written to committed project files.
 
 ## Lifecycle
 

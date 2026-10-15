@@ -178,6 +178,7 @@ func _process(delta: float) -> void:
 	_coordinator.poll()
 	_scene_sync.poll()
 	_save_service.poll()
+	_workspace.poll()
 	_transfer.poll()
 	if _coordinator.session_manager.is_active():
 		update_overlays()
@@ -411,15 +412,27 @@ func _on_session_started(is_host: bool) -> void:
 	_dock.set_hosting_controls(true)
 	_dock.set_mode(_coordinator.workspace_mode)
 	_dock.set_participants(_coordinator.registry.all())
+	_dock.push_message("Note: editing files under addons/ while a session is live is not supported and can crash clients.", true)
 	_ensure_scene_binding()
 	_last_focus_sent = ""
 	_coordinator.send_scene_focus(_attached_scene_id)
+	if _workspace.enabled and _settings.get_bool(CollabSettings.KEY_FILE_SYNC, true):
+		_workspace.file_sync_enabled = true
+		_workspace.prime_file_baseline()
+	else:
+		_workspace.file_sync_enabled = false
 	if is_host and _workspace.enabled:
 		_workspace.broadcast_scene_list()
 		_dock.set_scenes(_workspace.scan_scenes())
+	elif not is_host and _scene_sync.enabled:
+		# Ask for the authoritative snapshot so node ids are reconciled with the
+		# host even before the first edit. Without this a rejoining client could
+		# target a same-numbered but different local node.
+		_scene_sync.request_snapshot()
 
 
 func _on_session_stopped(reason: String) -> void:
+	_workspace.file_sync_enabled = false
 	_presence.cursor_state.clear()
 	_dock.set_participants([])
 	_dock.set_scenes([])

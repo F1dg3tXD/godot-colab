@@ -12,6 +12,12 @@
 ## The host also advertises the project's scenes
 ## ([constant CollabProtocol.MessageType.SCENE_LIST]) so clients can discover and
 ## open scenes created by others. Nothing here executes transferred content.
+##
+## The same service also performs host-authoritative *source file* sync: scripts,
+## shaders, resources and project configuration are watched for changes and
+## relayed to the host (files under [code]addons/[/code] are deliberately
+## excluded - editing the add-on's own files while it is running can crash a
+## client and corrupt its project copy).
 class_name CollabWorkspaceService
 extends Node
 
@@ -21,9 +27,33 @@ signal request_result(request_id: int, ok: bool, path: String, message: String)
 signal scene_list_received(scenes: Array, host_revision: int)
 
 ## Prefixes that are never writable, regardless of extension.
-const EXCLUDED_PREFIXES: Array[String] = [".godot/", ".git/"]
+## [code]addons/[/code] is included because live-editing an active add-on (and
+## syncing that edit to a client) can crash the client and corrupt its project.
+const EXCLUDED_PREFIXES: Array[String] = [".godot/", ".git/", "addons/"]
+
+## Prefixes excluded from the source-file watcher only (never from scene lists).
+const FILESYNC_EXCLUDED_PREFIXES: Array[String] = [".godot/", ".git/", "addons/", ".vscode/", ".idea/", ".import/", "android/"]
+
+## Text/source extensions relayed by the file watcher. Scene files (.tscn) are
+## excluded on purpose: live scenes are synchronised as structured operations,
+## so shipping the whole file would fight with the operation stream.
+const FILESYNC_EXTENSIONS: Array[String] = [
+	".gd", ".gdshader", ".shader", ".gdshaderinc", ".tres", ".res",
+	".json", ".cfg", ".txt", ".csv", ".xml", ".md", ".po", ".svg",
+]
+
+## Exact file names (with no useful extension) that are still watched.
+const FILESYNC_FILES: Array[String] = ["project.godot", "export_presets.cfg"]
+
+## How often the file watcher scans the project for changes.
+const FILESYNC_INTERVAL_MS: int = 1200
+
+## Upper bound on the number of files the watcher tracks.
+const FILESYNC_MAX_FILES: int = 8000
 
 var enabled: bool = true
+## When true the service watches project source files and relays changes.
+var file_sync_enabled: bool = false
 
 var _coordinator: CollabSessionCoordinator
 var _settings: CollabSettings
@@ -32,6 +62,9 @@ var _project_root: Callable = Callable()
 var _editor: Dictionary = {}
 var _host_revision: int = 0
 var _request_counter: int = 0
+var _watch_baseline: Dictionary = {} # rel -> {size:int, mtime:int, sha:String}
+var _watch_last_ms: int = 0
+var _watch_primed: bool = false
 
 
 func setup(coordinator: CollabSessionCoordinator, settings: CollabSettings, logs: CollabLog, project_root: Callable, editor: Dictionary) -> void:
@@ -255,6 +288,7 @@ func _host_add_file(request_id: int, path: String, bytes: PackedByteArray, overw
 	_revision_bump()
 	_broadcast_file_apply(rel, bytes, rel.ends_with(".tscn"))
 	_refresh_filesystem(rel)
+	_refresh_baseline_entry(rel)
 	_send_result(from_peer, request_id, true, rel, "File added.")
 	status.emit("Added file '%s'." % rel)
 
@@ -293,6 +327,7 @@ func _apply_incoming_file(payload: Dictionary) -> void:
 	file.store_buffer(bytes)
 	file.close()
 	_refresh_filesystem(rel)
+	_refresh_baseline_entry(rel)
 	status.emit("Applied file '%s' from host." % rel)
 
 
@@ -339,6 +374,182 @@ func _send_scene_list_to(peer_id: int) -> void:
 
 
 # ---------------------------------------------------------------------------
+# Source-file sync (scripts, shaders, resources, project configuration)
+# ---------------------------------------------------------------------------
+
+## Records the current on-disk state as the baseline without syncing anything.
+## Called when a session starts so pre-existing differences are not blasted at
+## the host (project transfer / snapshots reconcile those instead).
+func prime_file_baseline() -> void:
+	_watch_baseline.clear()
+	_watch_primed = false
+	var root: String = str(_project_root.call())
+	if root.is_empty():
+		return
+	var current: Dictionary = {}
+	_walk_files(root, "", current)
+	_watch_baseline = current
+	_watch_primed = true
+	status.emit("File sync baseline: %d source file(s)." % current.size())
+
+
+## Scans tracked source files for local changes and relays them
+## host-authoritatively. Host changes broadcast directly; client changes are
+## submitted to the host as ADD_FILE requests.
+func poll() -> void:
+	if not file_sync_enabled or not enabled:
+		return
+	if _coordinator == null or not _coordinator.session_manager.is_active():
+		return
+	if _coordinator.workspace_mode == CollabConstants.WorkspaceMode.GIT_PRESENCE:
+		return
+	var now: int = Time.get_ticks_msec()
+	if now - _watch_last_ms < FILESYNC_INTERVAL_MS:
+		return
+	_watch_last_ms = now
+	_scan_and_sync()
+
+
+func _scan_and_sync() -> void:
+	var root: String = str(_project_root.call())
+	if root.is_empty():
+		return
+	var current: Dictionary = {}
+	_walk_files(root, "", current)
+	# Removed files simply leave the baseline; we do not delete remotely.
+	for rel in _watch_baseline.keys():
+		if not current.has(rel):
+			_watch_baseline.erase(rel)
+	for rel in current.keys():
+		var info: Dictionary = current[rel]
+		var previous: Variant = _watch_baseline.get(rel)
+		if previous == null:
+			_watch_baseline[rel] = info
+			if _watch_primed:
+				_relay_local_change(rel, root)
+			continue
+		var prev: Dictionary = previous
+		if int(prev.get("size", -1)) == int(info.get("size", -2)) and int(prev.get("mtime", -1)) == int(info.get("mtime", -2)):
+			continue
+		var digest: String = CollabIdentity.sha256_file(root.path_join(rel))
+		info["sha"] = digest
+		_watch_baseline[rel] = info
+		if digest != str(prev.get("sha", "")):
+			_relay_local_change(rel, root)
+	_watch_primed = true
+
+
+func _relay_local_change(rel: String, root: String) -> void:
+	if not _is_filesync_path(rel):
+		return
+	if not _can_request():
+		return
+	var absolute: String = CollabPathGuard.resolve_within(root, rel)
+	if absolute.is_empty():
+		return
+	var bytes: PackedByteArray = FileAccess.get_file_as_bytes(absolute)
+	if bytes.is_empty() and not FileAccess.file_exists(absolute):
+		return
+	if bytes.size() > CollabConstants.MAX_WORKSPACE_FILE_BYTES:
+		status.emit("Skipping '%s': exceeds the live-sync size limit." % rel)
+		return
+	if _coordinator.is_host():
+		_host_add_file(_next_request_id(), rel, bytes, true, _coordinator.local_peer_id())
+	else:
+		var text: String = bytes.get_string_from_utf8()
+		_coordinator.send_workspace(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+			"request_id": _next_request_id(),
+			"kind": CollabConstants.WorkspaceOp.ADD_FILE,
+			"path": rel,
+			"overwrite": true,
+			"text": text,
+		})
+		status.emit("Synced '%s' to the host." % rel)
+
+
+## Walks the project, collecting watched source files as rel -> {size, mtime, sha}.
+func _walk_files(absolute: String, rel_prefix: String, out: Dictionary) -> void:
+	if out.size() >= FILESYNC_MAX_FILES:
+		return
+	var dir: DirAccess = DirAccess.open(absolute)
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	var name: String = dir.get_next()
+	while name != "":
+		if name.begins_with(".") and name != "." and name != "..":
+			name = dir.get_next()
+			continue
+		var rel: String = (rel_prefix + "/" + name) if not rel_prefix.is_empty() else name
+		var abs: String = absolute.path_join(name)
+		if dir.current_is_dir():
+			if not dir.is_link(name) and not _filesync_dir_excluded(rel):
+				_walk_files(abs, rel, out)
+		elif _is_filesync_path(rel):
+			out[rel] = _file_stat(abs)
+		name = dir.get_next()
+	dir.list_dir_end()
+
+
+func _filesync_dir_excluded(rel: String) -> bool:
+	for prefix in FILESYNC_EXCLUDED_PREFIXES:
+		if (rel + "/").begins_with(prefix):
+			return true
+	return false
+
+
+func _is_filesync_path(rel: String) -> bool:
+	return is_source_file(rel)
+
+
+## True when [param rel] is a project source file the watcher may relay. Excludes
+## generated/vendor directories and, critically, [code]addons/[/code].
+static func is_source_file(rel: String) -> bool:
+	var normalized: String = CollabPathGuard.normalize_relative(rel)
+	if normalized.is_empty():
+		return false
+	for prefix in FILESYNC_EXCLUDED_PREFIXES:
+		if normalized.begins_with(prefix):
+			return false
+	if FILESYNC_FILES.has(normalized):
+		return true
+	var ext: String = "." + normalized.get_extension().to_lower()
+	return FILESYNC_EXTENSIONS.has(ext)
+
+
+## Relative paths currently tracked by the file watcher. Exposed for tests.
+func watched_paths() -> Array:
+	var out: Array = _watch_baseline.keys()
+	out.sort()
+	return out
+
+
+func _file_stat(abs: String) -> Dictionary:
+	var file: FileAccess = FileAccess.open(abs, FileAccess.READ)
+	var size: int = 0
+	if file != null:
+		size = file.get_length()
+		file.close()
+	return {"size": size, "mtime": FileAccess.get_modified_time(abs), "sha": ""}
+
+
+## Updates the watcher baseline for [param rel] from its current on-disk state so
+## writing a file (locally or from the host) never echoes back as a change.
+func _refresh_baseline_entry(rel: String) -> void:
+	if not file_sync_enabled:
+		return
+	var root: String = str(_project_root.call())
+	if root.is_empty():
+		return
+	var absolute: String = CollabPathGuard.resolve_within(root, rel)
+	if absolute.is_empty() or not FileAccess.file_exists(absolute):
+		return
+	var info: Dictionary = _file_stat(absolute)
+	info["sha"] = CollabIdentity.sha256_file(absolute)
+	_watch_baseline[rel] = info
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -360,6 +571,9 @@ func _is_writable_path(rel: String) -> bool:
 	for prefix in EXCLUDED_PREFIXES:
 		if rel.begins_with(prefix):
 			return false
+	# Project configuration is host-authoritative and small enough to relay.
+	if FILESYNC_FILES.has(rel):
+		return true
 	var ext: String = "." + rel.get_extension().to_lower()
 	return CollabConstants.WRITABLE_EXTENSIONS.has(ext)
 

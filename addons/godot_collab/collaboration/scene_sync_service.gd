@@ -163,6 +163,15 @@ func has_pending_snapshot() -> bool:
 	return not _pending_snapshot.is_empty()
 
 
+## Returns the stable id currently mapped to [param node] within
+## [param p_scene_id], or -1 when the node is not tracked. Exposed for tests.
+func node_id_for_scene(p_scene_id: String, node: Node) -> int:
+	var ctx: CollabSceneContext = _scenes.get(p_scene_id)
+	if ctx == null:
+		return -1
+	return ctx.node_ids.id_for(node)
+
+
 func poll() -> void:
 	if not enabled:
 		return
@@ -250,8 +259,15 @@ func _on_scene_message(from_peer: int, type: int, payload: Dictionary) -> void:
 				_send_reply_snapshot(from_peer, payload)
 		CollabProtocol.MessageType.SNAPSHOT_RESPONSE:
 			_pending_snapshot = payload
-			if auto_apply_snapshot and not _coordinator.is_host():
-				apply_pending_snapshot()
+			if not _coordinator.is_host():
+				if auto_apply_snapshot:
+					apply_pending_snapshot()
+				else:
+					# The user chose to review the snapshot before replacing their
+					# scene, but node identities must still be reconciled or a
+					# later local edit could target a different node on the host.
+					reconcile_ids_from_snapshot(payload)
+				snapshot_offered.emit((payload.get("nodes", []) as Array).size(), int(payload.get("revision", 0)))
 			else:
 				snapshot_offered.emit((payload.get("nodes", []) as Array).size(), int(payload.get("revision", 0)))
 		CollabProtocol.MessageType.RESYNC_REQUIRED:
@@ -431,8 +447,26 @@ func _apply_create(op: Dictionary, ctx: CollabSceneContext) -> void:
 		t.origin = op.get("position", Vector3.ZERO)
 		t.basis = Basis.from_euler(op.get("rotation", Vector3.ZERO)).scaled(op.get("scale", Vector3.ONE))
 		(node as Node3D).transform = t
+	_apply_entry_props(node, op.get("props", {}), ctx)
 	ctx.node_ids.register(node, authoritative_id)
 	_mark_unsaved(ctx)
+
+
+## Applies a { property: { kind, value } } dictionary to [param node], skipping
+## anything that is no longer syncable on this node.
+func _apply_entry_props(node: Node, props: Variant, ctx: CollabSceneContext) -> void:
+	if typeof(props) != TYPE_DICTIONARY:
+		return
+	for prop in (props as Dictionary).keys():
+		var name: String = str(prop)
+		if not CollabSceneOperations.is_property_syncable(node, name):
+			continue
+		var encoded: Dictionary = (props as Dictionary)[prop]
+		var kind: String = str(encoded.get("kind", ""))
+		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
+		if kind == CollabSceneOperations.VALUE_RESOURCE and value == null:
+			continue
+		_apply_property_editor_safe(node, name, value, ctx)
 
 
 func _apply_remove(op: Dictionary, ctx: CollabSceneContext) -> void:
@@ -490,7 +524,7 @@ func _apply_property(op: Dictionary, ctx: CollabSceneContext) -> void:
 	if node == null:
 		return
 	var property: String = str(op.get("property", ""))
-	if not CollabSceneOperations.is_property_allowed(node, property):
+	if not CollabSceneOperations.is_property_syncable(node, property):
 		return
 	var kind: String = str(op.get("value_kind", ""))
 	var value: Variant = CollabSceneOperations.decode_value(kind, op.get("value", null))
@@ -528,6 +562,72 @@ func apply_pending_snapshot() -> void:
 
 func discard_pending_snapshot() -> void:
 	_pending_snapshot.clear()
+
+
+## Rebinds the local scene's node ids to the host's ids without replacing the
+## scene content. Used when auto-apply is disabled so a subsequent local edit
+## still targets the correct node instead of a same-numbered local node. Nodes
+## that cannot be matched by path keep their provisional ids and their edits are
+## safely rejected by the host rather than applied to the wrong node.
+func reconcile_ids_from_snapshot(snapshot: Dictionary) -> int:
+	var remote_scene: String = str(snapshot.get("scene_id", ""))
+	var ctx: CollabSceneContext = _scenes.get(remote_scene)
+	if ctx == null or ctx.root == null:
+		return 0
+	var nodes: Variant = snapshot.get("nodes", [])
+	if typeof(nodes) != TYPE_ARRAY or (nodes as Array).is_empty():
+		return 0
+	var path_for: Dictionary = _snapshot_paths(nodes as Array)
+	if path_for.is_empty():
+		return 0
+	ctx.node_ids.clear()
+	_aliases.erase(_alias_key(0, remote_scene))
+	_aliases.erase(_alias_key(_coordinator.local_peer_id(), remote_scene))
+	var matched: Array[int] = [0]
+	_reconcile_walk(ctx.root, "", path_for, ctx, matched)
+	ctx.revision = int(snapshot.get("revision", ctx.revision))
+	ctx.diff_watcher.refresh_baseline()
+	ctx.diff_watcher.base_revision = ctx.revision
+	if ctx.scene_id == _primary_scene_id:
+		revision = ctx.revision
+	if matched[0] > 0:
+		status.emit("Reconciled %d node id(s) with the host for %s." % [matched[0], remote_scene])
+	return matched[0]
+
+
+## Builds a "Name/Child/Grandchild" -> node_id map from a snapshot's node list.
+func _snapshot_paths(nodes: Array) -> Dictionary:
+	var by_id: Dictionary = {}
+	for entry in nodes:
+		if typeof(entry) == TYPE_DICTIONARY:
+			by_id[int((entry as Dictionary).get("node_id", -1))] = entry
+	var path_for: Dictionary = {}
+	for entry in nodes:
+		if typeof(entry) != TYPE_DICTIONARY:
+			continue
+		var id: int = int((entry as Dictionary).get("node_id", -1))
+		var names: Array[String] = []
+		var cur: int = id
+		var guard: int = 0
+		while by_id.has(cur) and guard < 4096:
+			names.push_front(str((by_id[cur] as Dictionary).get("name", "")))
+			cur = int((by_id[cur] as Dictionary).get("parent_id", -1))
+			guard += 1
+			if cur == -1:
+				break
+		path_for["/".join(names)] = id
+	return path_for
+
+
+func _reconcile_walk(node: Node, parent_path: String, path_for: Dictionary, ctx: CollabSceneContext, matched: Array) -> void:
+	if node == null:
+		return
+	var path: String = node.name if parent_path.is_empty() else parent_path + "/" + node.name
+	if path_for.has(path):
+		ctx.node_ids.register(node, int(path_for[path]))
+		matched[0] += 1
+	for child in node.get_children():
+		_reconcile_walk(child, path, path_for, ctx, matched)
 
 
 func _send_reply_snapshot(peer_id: int, payload: Dictionary) -> void:
@@ -657,7 +757,7 @@ func _apply_snapshot_node(ctx: CollabSceneContext, entry: Dictionary) -> void:
 func _apply_snapshot_props(ctx: CollabSceneContext, entry: Dictionary, node: Node) -> void:
 	var props: Dictionary = entry.get("props", {})
 	for prop in props.keys():
-		if not CollabSceneOperations.is_property_allowed(node, prop):
+		if not CollabSceneOperations.is_property_syncable(node, prop):
 			continue
 		var encoded: Dictionary = props[prop]
 		var kind: String = str(encoded.get("kind", ""))
@@ -769,24 +869,7 @@ func _alias_key(peer_id: int, p_scene_id: String) -> String:
 
 
 func _serialize_props(node: Node) -> Dictionary:
-	return _collect_props(node)
-
-
-func _collect_props(node: Node) -> Dictionary:
-	var out: Dictionary = {}
-	var check_class: String = node.get_class()
-	while not check_class.is_empty() and check_class != "Object":
-		if CollabSceneOperations.PROPERTY_WHITELIST.has(check_class):
-			for prop in CollabSceneOperations.PROPERTY_WHITELIST[check_class]:
-				if prop == "name" or prop == "position" or prop == "rotation" or prop == "scale":
-					continue
-				if not (prop in node):
-					continue
-				var encoded := CollabSceneOperations.encode_value(node.get(prop))
-				if encoded["kind"] != CollabSceneOperations.VALUE_UNSUPPORTED:
-					out[prop] = encoded
-		check_class = ClassDB.get_parent_class(check_class)
-	return out
+	return CollabSceneOperations.collect_syncable_props(node)
 
 
 func _resolve_aliases(ctx: CollabSceneContext, source_peer: int, op: Dictionary) -> Dictionary:

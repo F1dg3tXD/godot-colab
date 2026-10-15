@@ -49,6 +49,149 @@ func _test_node_id_map() -> void:
 	a.free()
 
 
+func _test_property_values() -> void:
+	print("[property values]")
+	# Round-trip every newly supported value shape.
+	var cases: Array = [
+		["vector2i", Vector2i(3, 4)],
+		["vector3i", Vector3i(1, 2, 3)],
+		["rect2", Rect2(1, 2, 3, 4)],
+		["transform3d", Transform3D(Basis.from_euler(Vector3(1, 2, 3)), Vector3(4, 5, 6))],
+		["aabb", AABB(Vector3.ONE, Vector3(2, 2, 2))],
+		["packed_string", PackedStringArray(["a", "b", "c"])],
+		["array", [1, "two", Vector3.ONE]],
+		["dictionary", {"k": 1, "v": Vector2(0.5, 0.5)}],
+		["string_name", "a_name"],
+	]
+	for case in cases:
+		var encoded: Dictionary = CollabSceneOperations.encode_value(case[1])
+		_check(encoded["kind"] != CollabSceneOperations.VALUE_UNSUPPORTED, "encode %s supported" % case[0])
+		var decoded: Variant = CollabSceneOperations.decode_value(encoded["kind"], encoded["value"])
+		_check(typeof(decoded) == typeof(case[1]), "decode %s preserves type" % case[0])
+		_check(decoded == case[1], "decode %s preserves value" % case[0])
+
+	# Containers holding live objects must be refused rather than silently lossy.
+	var with_node: Array = [Node.new()]
+	_check(CollabSceneOperations.encode_value(with_node)["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED, "array containing an Object is refused")
+	(with_node[0] as Node).free()
+
+	var node := Node.new()
+	_check(CollabSceneOperations.is_property_syncable(node, "process_priority"), "process_priority is syncable")
+	_check(CollabSceneOperations.is_property_syncable(node, "editor_description"), "editor_description is syncable")
+	_check(not CollabSceneOperations.is_property_syncable(node, "name"), "name is reserved")
+	_check(not CollabSceneOperations.is_property_syncable(node, "script"), "script is reserved")
+	var props: Dictionary = CollabSceneOperations.collect_syncable_props(node)
+	_check(props.has("process_priority") and props.has("process_mode"), "collect includes general Node properties")
+	node.free()
+
+	var n3d := Node3D.new()
+	_check(not CollabSceneOperations.is_property_syncable(n3d, "position"), "Node3D position handled by transform op")
+	_check(not CollabSceneOperations.is_property_syncable(n3d, "transform"), "Node3D transform is reserved")
+	var n3d_props: Dictionary = CollabSceneOperations.collect_syncable_props(n3d)
+	_check(n3d_props.has("visible") and n3d_props.has("process_priority"), "collect includes Node3D editor properties")
+	_check(not n3d_props.has("transform") and not n3d_props.has("position"), "collect excludes handled transform properties")
+	n3d.free()
+
+
+func _test_filesync_paths() -> void:
+	print("[file sync paths]")
+	_check(CollabWorkspaceService.is_source_file("scripts/player.gd"), "gd source file watched")
+	_check(CollabWorkspaceService.is_source_file("materials/sky.tres"), "tres resource watched")
+	_check(CollabWorkspaceService.is_source_file("project.godot"), "project.godot watched")
+	_check(CollabWorkspaceService.is_source_file("shaders/thing.gdshader"), "shader watched")
+	# The add-on's own files are never relayed: live-editing an active add-on can
+	# crash a client and corrupt its project copy.
+	_check(not CollabWorkspaceService.is_source_file("addons/godot_collab/plugin.gd"), "addon files excluded from sync")
+	_check(not CollabWorkspaceService.is_source_file(".godot/imported/x.gd"), "generated cache excluded")
+	_check(not CollabWorkspaceService.is_source_file(".git/hooks/x.gd"), "git metadata excluded")
+	_check(not CollabWorkspaceService.is_source_file("scenes/main.tscn"), "scene files use the operation stream")
+	_check(not CollabWorkspaceService.is_source_file("../escape.gd"), "traversal excluded")
+
+	# A real scan must pick up watched files and skip addons/ + caches.
+	var ws_root: String = "/tmp/opencode/filesync_ws"
+	DirAccess.make_dir_recursive_absolute(ws_root.path_join("scripts"))
+	DirAccess.make_dir_recursive_absolute(ws_root.path_join("addons/godot_collab"))
+	DirAccess.make_dir_recursive_absolute(ws_root.path_join(".godot"))
+	_write_text(ws_root.path_join("project.godot"), "config_version=5\n")
+	_write_text(ws_root.path_join("scripts/player.gd"), "extends Node\n")
+	_write_text(ws_root.path_join("addons/godot_collab/plugin.gd"), "extends Object\n")
+	_write_text(ws_root.path_join(".godot/cache.gd"), "cached\n")
+
+	var logs := CollabLog.new()
+	var manager := CollabSessionManager.new(logs)
+	var coordinator := CollabSessionCoordinator.new()
+	coordinator.setup(manager, logs)
+	var workspace := CollabWorkspaceService.new()
+	workspace.setup(coordinator, CollabSettings.new(), logs, func() -> String: return ws_root, {})
+	workspace.prime_file_baseline()
+	var watched: Array = workspace.watched_paths()
+	_check(watched.has("project.godot"), "baseline tracks project.godot")
+	_check(watched.has("scripts/player.gd"), "baseline tracks a project script")
+	_check(not watched.has("addons/godot_collab/plugin.gd"), "baseline never tracks addon files")
+	_check(not watched.has(".godot/cache.gd"), "baseline never tracks generated caches")
+
+	workspace.free()
+	coordinator.free()
+	manager.free()
+
+
+func _write_text(path: String, text: String) -> void:
+	DirAccess.make_dir_recursive_absolute(path.get_base_dir())
+	var file := FileAccess.open(path, FileAccess.WRITE)
+	if file != null:
+		file.store_string(text)
+		file.close()
+
+
+func _test_id_reconciliation() -> void:
+	print("[id reconciliation]")
+	var logs := CollabLog.new()
+	var manager := CollabSessionManager.new(logs)
+	var coordinator := CollabSessionCoordinator.new()
+	coordinator.setup(manager, logs)
+	coordinator.get_project_id = func() -> String: return "proj"
+	coordinator.get_scene_id = func() -> String: return "res://r.tscn"
+	coordinator.get_username = func() -> String: return "peer"
+
+	var sync := CollabSceneSyncService.new()
+	sync.setup(coordinator, logs, {"get_edited_root": func() -> Node: return null, "mark_unsaved": func() -> void: pass})
+	sync.auto_apply_snapshot = false
+
+	var root := Node3D.new()
+	root.name = "Root"
+	var box := Node3D.new()
+	box.name = "Box"
+	root.add_child(box)
+	var decoy := Node3D.new()
+	decoy.name = "Decoy"
+	root.add_child(decoy)
+
+	sync.bind_scene(root, "res://r.tscn", true)
+	# A non-host must never allocate the authoritative positive id space, so a
+	# local node can never collide with a same-numbered host node.
+	_check(sync.node_id_for_scene("res://r.tscn", box) < 0, "pre-session client ids are non-authoritative (negative)")
+	_check(sync.node_id_for_scene("res://r.tscn", decoy) < 0, "every pre-session client id is non-authoritative")
+
+	var snapshot: Dictionary = {
+		"scene_id": "res://r.tscn",
+		"revision": 5,
+		"nodes": [
+			{"node_id": 10, "parent_id": -1, "class": "Node3D", "name": "Root", "props": {}},
+			{"node_id": 20, "parent_id": 10, "class": "Node3D", "name": "Box", "props": {}},
+		],
+	}
+	var matched: int = sync.reconcile_ids_from_snapshot(snapshot)
+	_check(matched == 2, "reconcile matches root and box by path (got %d)" % matched)
+	_check(sync.node_id_for_scene("res://r.tscn", box) == 20, "box adopts the host's authoritative id")
+	_check(sync.node_id_for_scene("res://r.tscn", decoy) != 20, "unmatched local node never adopts the host's id for a different node")
+
+	sync.detach_scene()
+	root.free()
+	sync.free()
+	coordinator.free()
+	manager.free()
+
+
 func _init() -> void:
 	print("== Godot Collab headless tests ==")
 	_test_protocol()
@@ -56,8 +199,13 @@ func _init() -> void:
 	_test_path_guard()
 	_test_rate_limiter()
 	_test_node_id_map()
+	_test_property_values()
+	_test_filesync_paths()
+	_test_id_reconciliation()
 	_test_loopback_session()
 	_test_scene_sync_loopback()
+	_test_general_property_sync()
+	_test_rejoin_desync()
 	_test_multi_scene_isolation()
 	_test_marker_manager()
 	# The marker test needs a live frame so the node's ready/deferred calls run.
@@ -592,3 +740,194 @@ func _test_scene_sync_loopback() -> void:
 	client.free()
 	host_manager.free()
 	client_manager.free()
+
+
+## Verifies that ordinary inspector properties (not just the old hard-coded
+## whitelist) reach the host in both directions.
+func _test_general_property_sync() -> void:
+	print("[general property sync]")
+	var logs := CollabLog.new()
+	var port: int = 45982
+
+	var host_root := Node3D.new()
+	host_root.name = "Root"
+	var host_box := Node3D.new()
+	host_box.name = "Box"
+	host_root.add_child(host_box)
+
+	var client_root := Node3D.new()
+	client_root.name = "Root"
+
+	var host_manager := CollabSessionManager.new(logs)
+	var host := CollabSessionCoordinator.new()
+	host.setup(host_manager, logs)
+	var client_manager := CollabSessionManager.new(logs)
+	var client := CollabSessionCoordinator.new()
+	client.setup(client_manager, logs)
+
+	host.get_project_id = func() -> String: return "proj"
+	host.get_scene_id = func() -> String: return "res://g.tscn"
+	host.get_username = func() -> String: return "host"
+	client.get_project_id = func() -> String: return "proj"
+	client.get_scene_id = func() -> String: return "res://g.tscn"
+	client.get_username = func() -> String: return "peer"
+
+	var noop := func() -> void: pass
+	var host_sync := CollabSceneSyncService.new()
+	host_sync.setup(host, logs, {"get_edited_root": func() -> Node: return host_root, "mark_unsaved": noop})
+	var client_sync := CollabSceneSyncService.new()
+	client_sync.setup(client, logs, {"get_edited_root": func() -> Node: return client_root, "mark_unsaved": noop})
+	client_sync.auto_apply_snapshot = true
+
+	host_sync.attach_scene(host_root, "res://g.tscn")
+	client_sync.attach_scene(client_root, "res://g.tscn")
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "property host starts (%s)" % error_string(err))
+	err = client.join("127.0.0.1", port, "")
+	_check(err == OK, "property client joins (%s)" % error_string(err))
+
+	var synced: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		return client_root.get_node_or_null("Box") != null)
+	_check(synced, "client received the host snapshot")
+
+	# These two properties were absent from the old whitelist.
+	host_box.editor_description = "greetings"
+	host_box.process_priority = 7
+	var host_to_client: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		var cb: Node = client_root.get_node_or_null("Box")
+		return cb != null and cb.editor_description == "greetings" and cb.process_priority == 7)
+	_check(host_to_client, "host inspector property change (editor_description/process_priority) reached the client")
+
+	var client_box: Node3D = client_root.get_node_or_null("Box") as Node3D
+	if client_box != null:
+		client_box.visible = false
+	var client_to_host: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		return not host_box.visible)
+	_check(client_to_host, "client inspector property change (visible) reached the host")
+
+	client_sync.detach_scene()
+	host_sync.detach_scene()
+	client.stop("cleanup")
+	host.stop("cleanup")
+	host_root.free()
+	client_root.free()
+	host.free()
+	client.free()
+	host_manager.free()
+	client_manager.free()
+
+
+## Reproduces the reported post-crash bug: a client whose local scene does not
+## match the host (because it restarted / reopened a stale scene) must never
+## toggle a same-numbered but different local node on the host, and after a
+## reconnect its edits must address the right nodes again.
+func _test_rejoin_desync() -> void:
+	print("[rejoin desync]")
+	var logs := CollabLog.new()
+	var port: int = 45983
+
+	var host_root := Node3D.new()
+	host_root.name = "Root"
+	var host_box := Node3D.new()
+	host_box.name = "Box"
+	host_box.visible = true
+	host_root.add_child(host_box)
+
+	# The client has a differently-named node that would previously have been
+	# allocated the same positive id as the host's Box.
+	var client_root := Node3D.new()
+	client_root.name = "Root"
+	var decoy := Node3D.new()
+	decoy.name = "Decoy"
+	client_root.add_child(decoy)
+
+	var host_manager := CollabSessionManager.new(logs)
+	var host := CollabSessionCoordinator.new()
+	host.setup(host_manager, logs)
+	var client_manager := CollabSessionManager.new(logs)
+	var client := CollabSessionCoordinator.new()
+	client.setup(client_manager, logs)
+
+	host.get_project_id = func() -> String: return "proj"
+	host.get_scene_id = func() -> String: return "res://rejoin.tscn"
+	host.get_username = func() -> String: return "host"
+	client.get_project_id = func() -> String: return "proj"
+	client.get_scene_id = func() -> String: return "res://rejoin.tscn"
+	client.get_username = func() -> String: return "peer"
+
+	var noop := func() -> void: pass
+	var host_sync := CollabSceneSyncService.new()
+	host_sync.setup(host, logs, {"get_edited_root": func() -> Node: return host_root, "mark_unsaved": noop})
+	var client_sync := CollabSceneSyncService.new()
+	client_sync.setup(client, logs, {"get_edited_root": func() -> Node: return client_root, "mark_unsaved": noop})
+	client_sync.auto_apply_snapshot = true
+
+	host_sync.attach_scene(host_root, "res://rejoin.tscn")
+	client_sync.attach_scene(client_root, "res://rejoin.tscn")
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "rejoin host starts (%s)" % error_string(err))
+	err = client.join("127.0.0.1", port, "")
+	_check(err == OK, "rejoin client joins (%s)" % error_string(err))
+
+	var synced: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		return client_root.get_node_or_null("Box") != null and client_root.get_node_or_null("Decoy") == null)
+	_check(synced, "rejoining client's stale node replaced by the host snapshot")
+
+	var client_box: Node3D = client_root.get_node_or_null("Box") as Node3D
+	if client_box != null:
+		client_box.visible = false
+	var toggled_correct: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		return not host_box.visible)
+	_check(toggled_correct, "client visibility toggle reaches the host's Box")
+	_check(host_root.get_node_or_null("Decoy") == null, "no phantom node appeared on the host")
+
+	# Disconnect and reconnect with a fresh client: its local ids must be
+	# re-keyed to the host's again, not left stale.
+	client_sync.detach_scene()
+	client.stop("simulated crash")
+	var drain: int = Time.get_ticks_msec() + 300
+	while Time.get_ticks_msec() < drain:
+		host.poll()
+		host_sync.poll()
+		OS.delay_msec(5)
+
+	var client2_manager := CollabSessionManager.new(logs)
+	var client2 := CollabSessionCoordinator.new()
+	client2.setup(client2_manager, logs)
+	client2.get_project_id = func() -> String: return "proj"
+	client2.get_scene_id = func() -> String: return "res://rejoin.tscn"
+	client2.get_username = func() -> String: return "peer2"
+	var client2_sync := CollabSceneSyncService.new()
+	client2_sync.setup(client2, logs, {"get_edited_root": func() -> Node: return client_root, "mark_unsaved": noop})
+	client2_sync.auto_apply_snapshot = true
+	client2_sync.attach_scene(client_root, "res://rejoin.tscn")
+
+	err = client2.join("127.0.0.1", port, "")
+	_check(err == OK, "client reconnects (%s)" % error_string(err))
+	var resynced: bool = _pump(host, client2, host_sync, client2_sync, 6000, func() -> bool:
+		var cb: Node = client_root.get_node_or_null("Box")
+		return client2.local_peer_id() > 0 and cb != null and client2_sync.node_id_for_scene("res://rejoin.tscn", cb) > 0)
+	_check(resynced, "client resynced and re-keyed to host ids after reconnect")
+
+	var client_box2: Node3D = client_root.get_node_or_null("Box") as Node3D
+	if client_box2 != null:
+		client_box2.visible = true
+	var toggled_after: bool = _pump(host, client2, host_sync, client2_sync, 5000, func() -> bool:
+		return host_box.visible)
+	_check(toggled_after, "post-reconnect toggle targets the correct node")
+	_check(host_root.get_node_or_null("Decoy") == null, "no phantom node appeared after reconnect")
+
+	client2_sync.detach_scene()
+	host_sync.detach_scene()
+	client2.stop("cleanup")
+	host.stop("cleanup")
+	host_root.free()
+	client_root.free()
+	host.free()
+	client.free()
+	client2.free()
+	host_manager.free()
+	client_manager.free()
+	client2_manager.free()
