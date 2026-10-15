@@ -15,11 +15,16 @@ cd /path/to/godot-colab
   is printed individually.
 - The suite covers: protocol framing/validation (bad magic, truncated packets,
   oversized payloads, non-dictionary payloads), invitation code encode/decode,
-  path guard (traversal/absolute/symlink), rate limiter, marker scene
-  instantiation with username/colour application and no-op default colour, an
-  ENet loopback host/client handshake with cursor relay and host-disconnect
-  detection, and a two-scene loopback test where a host scene is snapshotted to
-  a joining peer and host/peer transform edits propagate both ways.
+  path guard (traversal/absolute/symlink), rate limiter, node-id allocation
+  (positive authoritative ids, `-1` sentinel avoidance, no id reuse after
+  `clear()`), marker scene instantiation with username/colour application and
+  no-op default colour, a `CollabMarkerManager` check (marker created for a
+  remote cursor, parented into the viewport container, removed when the cursor
+  disappears or the peer is in another scene), an ENet loopback host/client
+  handshake with cursor relay and host-disconnect detection, and a two-scene
+  loopback test where a host scene is snapshotted to a joining peer and
+  host/peer create/remove/transform edits propagate both ways without id
+  collisions or duplicated nodes.
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -75,8 +80,9 @@ instances, enable **Godot Collab** in each, and run through the checks:
 3. **Usernames + participant list.** Both docks list two participants with the
    correct names and host/client roles.
 4. **Remote cursors.** Move the mouse over Alice's 3D viewport: Bob sees a
-   coloured cursor + username, and vice-versa. Close Bob: his cursor disappears
-   from Alice immediately.
+   coloured 2D cursor + username overlay **and** a live 3D `editorNodeVis`
+   marker for Alice (and vice-versa). Disconnect Alice: both the overlay and the
+   3D marker disappear immediately.
 5. **Normal editor controls still work.** Orbit/pan/zoom and selection in the 3D
    viewport behave normally on both sides.
 6. **Incompatible project/scene warning.** Open a different scene in Bob (or

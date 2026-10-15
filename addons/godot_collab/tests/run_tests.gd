@@ -22,14 +22,43 @@ func _check(condition: bool, label: String) -> void:
 		print("  FAIL: ", label)
 
 
+func _count_prefixed(root: Node, prefix: String) -> int:
+	var count: int = 0
+	for child in root.get_children():
+		if str(child.name).begins_with(prefix):
+			count += 1
+	return count
+
+
+func _test_node_id_map() -> void:
+	print("[node id map]")
+	var map := CollabNodeIdMap.new()
+	var a := Node.new()
+	var first: int = map.allocate_id()
+	_check(first > 0, "authoritative ids are positive")
+	var temp: int = map.allocate_temp_id()
+	_check(temp != -1, "temporary ids never use the -1 'no id' sentinel")
+	map.register(a, first)
+	# clear() must not hand out ids that live nodes still hold, otherwise a node
+	# created right after a snapshot overwrites the reverse mapping.
+	map.clear()
+	var after: int = map.allocate_id()
+	_check(after > first, "authoritative ids never repeat after clear()")
+	var temp2: int = map.allocate_temp_id()
+	_check(temp2 != temp, "temporary ids never repeat after clear()")
+	a.free()
+
+
 func _init() -> void:
 	print("== Godot Collab headless tests ==")
 	_test_protocol()
 	_test_invite_codes()
 	_test_path_guard()
 	_test_rate_limiter()
+	_test_node_id_map()
 	_test_loopback_session()
 	_test_scene_sync_loopback()
+	_test_marker_manager()
 	# The marker test needs a live frame so the node's ready/deferred calls run.
 	_run_marker_test_then_finish()
 
@@ -124,6 +153,55 @@ func _test_rate_limiter() -> void:
 		if limiter.try_consume():
 			allowed += 1
 	_check(allowed == 3, "burst limited to capacity (got %d)" % allowed)
+
+
+func _test_marker_manager() -> void:
+	print("[marker manager]")
+	var logs := CollabLog.new()
+	var viewport := SubViewport.new()
+	root.add_child(viewport)
+
+	var manager_node := CollabSessionManager.new(logs)
+	var coordinator := CollabSessionCoordinator.new()
+	coordinator.setup(manager_node, logs)
+	coordinator.get_project_id = func() -> String: return "proj"
+	coordinator.get_scene_id = func() -> String: return "res://scene.tscn"
+	coordinator.get_username = func() -> String: return "host"
+
+	var state := CollabCursorState.new()
+	var markers := CollabMarkerManager.new()
+	markers.setup(coordinator, CollabSettings.new(), logs, state)
+	markers.set_viewport_provider(func() -> SubViewport: return viewport)
+	root.add_child(markers)
+
+	var err: Error = coordinator.start_host(45980, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "marker host starts (%s)" % error_string(err))
+	coordinator.registry.upsert(CollabParticipant.make(2, "Bob", false, true))
+	markers.set_local_scene_id("res://scene.tscn")
+
+	var camera := Transform3D(Basis(), Vector3(0.0, 5.0, 10.0))
+	state.update(2, camera, Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), Vector2(0.5, 0.5), "res://scene.tscn")
+	markers.poll()
+	_check(markers.has_marker(2), "a marker is created for a remote cursor")
+	_check(markers.marker_count() == 1, "exactly one marker per remote peer")
+	var created: Node = viewport.get_node_or_null("CollabUserMarkers/CollabPeer_2")
+	_check(created != null, "marker is parented into the editor viewport container")
+	if created is Node3D:
+		_check((created as Node3D).position.is_equal_approx(Vector3(0.0, 0.0, -12.0)), "marker sits at the configured depth along the remote ray")
+
+	state.remove(2)
+	markers.poll()
+	_check(not markers.has_marker(2), "marker is removed when the remote cursor is gone")
+
+	state.update(2, camera, Vector3(0.0, 0.0, 0.0), Vector3(0.0, 0.0, -1.0), Vector2(0.5, 0.5), "res://other.tscn")
+	markers.poll()
+	_check(not markers.has_marker(2), "marker hidden when the peer is editing another scene")
+
+	coordinator.stop("cleanup")
+	markers.free()
+	viewport.free()
+	coordinator.free()
+	manager_node.free()
 
 
 func _test_marker_visuals() -> void:
@@ -306,10 +384,13 @@ func _test_scene_sync_loopback() -> void:
 	client_sync.setup(client, logs, {"get_edited_root": get_client_root, "mark_unsaved": noop})
 	client_sync.auto_apply_snapshot = true
 
-	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
-	_check(err == OK, "sync host starts (%s)" % error_string(err))
+	# The plugin attaches the edited scene when the plugin enables, before any
+	# session exists, so reproduce that ordering here.
 	host_sync.attach_scene(host_root, "res://scene.tscn")
 	client_sync.attach_scene(client_root, "res://scene.tscn")
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "sync host starts (%s)" % error_string(err))
 	err = client.join("127.0.0.1", port, "")
 	_check(err == OK, "sync client join starts (%s)" % error_string(err))
 
@@ -333,11 +414,54 @@ func _test_scene_sync_loopback() -> void:
 	_check(client_box != null and client_box.position.is_equal_approx(Vector3(4.0, 5.0, 6.0)), "peer edit stayed visible locally")
 
 	# A host edit must reach the peer.
-	if host_box_after != null:
-		host_box_after.position = Vector3(7.0, 8.0, 9.0)
+	var host_only := Node3D.new()
+	host_only.name = "HostOnly"
+	host_only.position = Vector3(7.0, 8.0, 9.0)
+	host_root.add_child(host_only)
 	var host_propagated: bool = _pump(host, client, host_sync, client_sync, 4000, func() -> bool:
-		return client_box != null and client_box.position.is_equal_approx(Vector3(7.0, 8.0, 9.0)))
-	_check(host_propagated, "host edit propagated to the peer")
+		var cb: Node3D = client_root.get_node_or_null("HostOnly") as Node3D
+		return cb != null and cb.position.is_equal_approx(Vector3(7.0, 8.0, 9.0)))
+	_check(host_propagated, "host-created node propagated to the peer")
+
+	# A peer-created node must reach the host and stay on the peer.
+	var peer_box := Node3D.new()
+	peer_box.name = "PeerBox"
+	peer_box.position = Vector3(10.0, 11.0, 12.0)
+	client_root.add_child(peer_box)
+	var created: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		var hb: Node3D = host_root.get_node_or_null("PeerBox") as Node3D
+		return hb != null and hb.position.is_equal_approx(Vector3(10.0, 11.0, 12.0)))
+	_check(created, "host received the peer-created node")
+	_check(client_root.get_node_or_null("PeerBox") != null, "peer-created node stayed visible locally")
+	_check(_count_prefixed(host_root, "PeerBox") == 1, "host has exactly one copy of the peer-created node")
+	_check(_count_prefixed(client_root, "PeerBox") == 1, "client has exactly one copy of its created node")
+
+	# A peer edit to its own created node must target that node on the host and
+	# must never collide with another node's id (e.g. the scene root).
+	var peer_box_node: Node3D = client_root.get_node_or_null("PeerBox")
+	if peer_box_node != null:
+		peer_box_node.position = Vector3(7.5, 7.5, 7.5)
+	var peer_edit: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		var hb: Node = host_root.get_node_or_null("PeerBox")
+		return hb is Node3D and (hb as Node3D).position.is_equal_approx(Vector3(7.5, 7.5, 7.5)))
+	_check(peer_edit, "peer edit to its created node reached that node on the host")
+	_check(host_root.position.is_zero_approx(), "host scene root was not moved by a peer node edit")
+
+	# The host must also observe a peer removal.
+	if client_box != null:
+		client_root.remove_child(client_box)
+		client_box.free()
+	var removed: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		return host_root.get_node_or_null("Box") == null)
+	_check(removed, "host observed the peer removal")
+
+	# Simulate the client requesting a snapshot after editing: the host's scene
+	# already contains the peer's edits, so a pull must not undo them.
+	client_sync.request_snapshot()
+	var survives_pull: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		return client_root.get_node_or_null("PeerBox") != null and client_root.get_node_or_null("HostOnly") != null)
+	_check(survives_pull, "peer edits survived a snapshot request round-trip")
+	_check(client_root.get_node_or_null("Box") == null, "removed node stayed removed after snapshot")
 
 	client_sync.detach_scene()
 	host_sync.detach_scene()

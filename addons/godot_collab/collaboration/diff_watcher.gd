@@ -147,7 +147,13 @@ func _ensure_id(node: Node) -> int:
 	var node_id: int = _node_ids.id_for(node)
 	if node_id != -1:
 		return node_id
-	node_id = _node_ids.allocate_id() if is_host else _node_ids.allocate_temp_id()
+	# Only a client that is actively inside a session may allocate temporary
+	# negative ids; those are re-keyed to the host's authoritative id on the
+	# first create echo. Everyone else (the host, and any editor that is not yet
+	# in a session) allocates stable authoritative ids so the id space never
+	# mixes signs for the same scene.
+	var authoritative: bool = is_host or local_peer_id == 0
+	node_id = _node_ids.allocate_id() if authoritative else _node_ids.allocate_temp_id()
 	_node_ids.register(node, node_id)
 	return node_id
 

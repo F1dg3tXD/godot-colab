@@ -71,6 +71,11 @@ are listed explicitly so nothing here is mistaken for working functionality.
   (no guaranteed surface picking).
 - Cursors for users viewing a different scene or outside the local view may be
   hidden.
+- The live 3D markers (`CollabMarkerManager` / `assets/editorNodeVis.tscn`) are
+  only shown while a session is active and the editor has a 3D viewport. If the
+  editor is opened in a layout without a 3D viewport the markers are skipped
+  (the 2D overlay cursors still require the 3D viewport too). Markers follow the
+  same configurable ray depth as the 2D overlay and are not surface-picked.
 
 ## Saving
 

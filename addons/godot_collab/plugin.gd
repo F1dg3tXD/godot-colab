@@ -17,6 +17,7 @@ var _editor: EditorInterface
 var _session_manager: CollabSessionManager
 var _coordinator: CollabSessionCoordinator
 var _presence: CollabPresenceService
+var _markers: CollabMarkerManager
 var _scene_sync: CollabSceneSyncService
 var _save_service: CollabSaveService
 var _transfer: CollabTransferManager
@@ -55,7 +56,7 @@ func _enter_tree() -> void:
 	_coordinator.session_manager = _session_manager
 	_coordinator.setup(_session_manager, _logs)
 	_coordinator.get_project_id = Callable(self, "_project_id")
-	_coordinator.get_scene_id = Callable(self, "_scene_id")
+	_coordinator.get_scene_id = Callable(self, "_edited_scene_path")
 	_coordinator.get_username = Callable(self, "_username")
 	_coordinator.capabilities = {
 		"cursor": true,
@@ -79,6 +80,11 @@ func _enter_tree() -> void:
 	_presence.setup(_coordinator, _settings, _logs)
 	_presence.set_editor_interface_provider(Callable(self, "get_editor_interface"))
 	add_child(_presence)
+
+	_markers = CollabMarkerManager.new()
+	_markers.setup(_coordinator, _settings, _logs, _presence.cursor_state)
+	_markers.set_viewport_provider(Callable(self, "_editor_viewport_3d"))
+	add_child(_markers)
 
 	_scene_sync = CollabSceneSyncService.new()
 	_scene_sync.setup(_coordinator, _logs, editor_callables)
@@ -137,11 +143,12 @@ func _exit_tree() -> void:
 		remove_control_from_docks(_dock)
 		_dock.queue_free()
 		_dock = null
-	for node in [_presence, _scene_sync, _save_service, _transfer, _rendezvous, _coordinator, _session_manager]:
+	for node in [_presence, _markers, _scene_sync, _save_service, _transfer, _rendezvous, _coordinator, _session_manager]:
 		if node != null and is_instance_valid(node):
 			remove_child(node)
 			node.free()
 	_presence = null
+	_markers = null
 	_scene_sync = null
 	_save_service = null
 	_transfer = null
@@ -162,6 +169,7 @@ func _process(delta: float) -> void:
 	_transfer.poll()
 	if _coordinator.session_manager.is_active():
 		update_overlays()
+		_markers.poll()
 	# Keep the dock's participant list and connectivity reasonably fresh.
 	if _coordinator.session_manager.is_active() and _times % 15 == 0:
 		_dock.set_participants(_coordinator.registry.all())
@@ -510,6 +518,12 @@ func _edited_root() -> Node:
 	return _editor.get_edited_scene_root()
 
 
+func _editor_viewport_3d() -> SubViewport:
+	if _editor == null:
+		return null
+	return _editor.get_editor_viewport_3d()
+
+
 func _save_scene() -> int:
 	if _editor == null:
 		return FAILED
@@ -552,12 +566,14 @@ func _ensure_scene_binding() -> void:
 		_attached_scene_id = ""
 		_scene_sync.detach_scene()
 		_presence.set_local_scene_id("")
+		_markers.set_local_scene_id("")
 		if _coordinator.is_host():
 			_coordinator.refresh_host_scene_id()
 		return
 	_attached_scene_id = "" if root.scene_file_path.is_empty() else root.scene_file_path
 	_scene_sync.attach_scene(root, _attached_scene_id)
 	_presence.set_local_scene_id(_attached_scene_id)
+	_markers.set_local_scene_id(_attached_scene_id)
 	if _coordinator.is_host():
 		_coordinator.refresh_host_scene_id()
 
@@ -590,7 +606,7 @@ func _forward_3d_gui_input(viewport_camera: Camera3D, event: InputEvent) -> int:
 	var motion: InputEventMouseMotion = event as InputEventMouseMotion
 	if motion == null:
 		return EditorPlugin.AFTER_GUI_INPUT_PASS
-	var viewport_3d: SubViewport = _editor.get_editor_viewport_3d()
+	var viewport_3d: SubViewport = _editor_viewport_3d()
 	if viewport_3d == null:
 		return EditorPlugin.AFTER_GUI_INPUT_PASS
 	_presence.sample_local_cursor(viewport_camera, motion.position, Vector2(viewport_3d.size), _attached_scene_id)

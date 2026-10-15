@@ -20,6 +20,8 @@ const KEY_ENABLE_UPNP: String = SETTING_ROOT + "/network/enable_upnp"
 const KEY_CURSOR_LABEL_KEY: String = SETTING_ROOT + "/cursors/show_labels"
 const KEY_CURSOR_SIZE_KEY: String = SETTING_ROOT + "/cursors/marker_size"
 const KEY_CURSOR_DEPTH_KEY: String = SETTING_ROOT + "/cursors/marker_depth"
+const KEY_CURSOR_3D_MARKERS: String = SETTING_ROOT + "/cursors/show_3d_markers"
+const KEY_CURSOR_3D_SCALE: String = SETTING_ROOT + "/cursors/marker_3d_scale"
 const KEY_AUTOSAVE: String = SETTING_ROOT + "/saving/auto_save"
 const KEY_AUTOSAVE_DELAY: String = SETTING_ROOT + "/saving/auto_save_delay"
 const KEY_AUTO_APPLY_SNAPSHOT: String = SETTING_ROOT + "/collaboration/auto_apply_snapshot"
@@ -51,6 +53,8 @@ func register_defaults() -> void:
 	_register(KEY_CURSOR_LABEL_KEY, true, TYPE_BOOL, "Draw usernames next to remote cursors.")
 	_register(KEY_CURSOR_SIZE_KEY, 8.0, TYPE_FLOAT, "Remote cursor marker size in pixels.", 2.0, 64.0)
 	_register(KEY_CURSOR_DEPTH_KEY, 12.0, TYPE_FLOAT, "Distance along the remote camera ray (world units) at which the marker is drawn.", 0.1, 500.0)
+	_register(KEY_CURSOR_3D_MARKERS, true, TYPE_BOOL, "Show a live 3D marker for each remote participant in the editor viewport.")
+	_register(KEY_CURSOR_3D_SCALE, 1.0, TYPE_FLOAT, "Scale of the remote participant 3D markers.", 0.1, 20.0)
 	_register(KEY_AUTOSAVE, false, TYPE_BOOL, "Automatically save the shared scene after inactivity.")
 	_register(KEY_AUTOSAVE_DELAY, 8.0, TYPE_FLOAT, "Seconds of inactivity before auto-saving the shared scene.", 2.0, 120.0)
 	_register(KEY_AUTO_APPLY_SNAPSHOT, true, TYPE_BOOL, "Automatically mirror the host scene when joining a host-workspace session.")

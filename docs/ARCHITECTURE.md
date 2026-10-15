@@ -36,6 +36,7 @@ someone maintaining the add-on, not at end users.
 | `CollabParticipant` / `CollabParticipantRegistry` | `network/participant.gd`, `network/participant_registry.gd` | Participant records and authoritative list. |
 | `CollabPresenceService` | `presence/presence_service.gd` | Samples the local camera ray, sends/relays cursor updates, stores remote cursor state, draws overlays. |
 | `CollabCursorState` | `presence/cursor_state.gd` | Per-participant cursor state + interpolation + staleness. |
+| `CollabMarkerManager` | `presence/marker_manager.gd` | Spawns/updates/removes a live 3D `editorNodeVis` marker per remote participant in the editor viewport. |
 | `CollabSceneOperations` | `collaboration/scene_operations.gd` | Builds and validates structured scene operations. |
 | `CollabNodeIdMap` | `collaboration/node_id_map.gd` | Stable session-level node IDs ↔ local `Node` mapping. |
 | `CollabDiffWatcher` | `collaboration/diff_watcher.gd` | Debounced snapshot/diff watcher for supported editor changes. |
@@ -135,6 +136,16 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
 - A **stable session node id** is assigned per node and mapped to the local node
   by `CollabNodeIdMap`. Operations reference these ids, not paths, so renames
   and reparents do not break references.
+- **Id allocation policy.** Authoritative ids are positive and host-assigned. The
+  editor binds the edited scene when the plugin enables (before any session
+  exists), so the host and any not-yet-connected editor allocate authoritative
+  ids (`CollabDiffWatcher._ensure_id`: `is_host or local_peer_id == 0`). Only a
+  peer that is actively inside a session as a client allocates temporary
+  negative ids; those are re-keyed to the host's authoritative id when the host
+  echoes the accepted create. `CollabNodeIdMap` reserves `-1` as the "no temp
+  id" sentinel and never reuses ids (its counters are monotonic across
+  `clear()`), so a node created right after a snapshot cannot collide with an id
+  that a live node already holds.
 - `CollabSceneSyncService` converts supported editor changes into structured
   `OPS`. Every operation carries session id, operation id, source peer, scene
   identity, target node id, base revision, operation type, and validated
@@ -202,6 +213,18 @@ unsupported node type) is never silently wiped.
   ray (depth/size/labels configurable) — it is **not** claimed to sit exactly on
   the surface under the remote pointer.
 - Disconnect clears the participant's overlay immediately.
+- `CollabMarkerManager` additionally renders a **live 3D marker** for every
+  remote participant: it instances `assets/editorNodeVis.tscn`
+  (`CollabUserMarker`) into a container parented to
+  `EditorInterface.get_editor_viewport_3d()`. The marker shares the edited
+  scene's `World3D` but is not part of the scene, so it is never serialised,
+  never shows in the Scene dock and never marks the scene dirty. Its position is
+  the interpolated point on the remote camera ray from `CollabCursorState`, and
+  its orientation follows the remote camera (`set_from_camera`). Markers are
+  created lazily, hidden for peers that are stale or in another scene, and
+  removed on disconnect / session stop. Visibility, label display and scale are
+  controlled by editor settings (`cursors/show_3d_markers`, `cursors/show_labels`,
+  `cursors/marker_3d_scale`; depth via `cursors/marker_depth`).
 
 ## Workspace modes
 

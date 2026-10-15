@@ -10,14 +10,17 @@ extends RefCounted
 var _by_id: Dictionary = {} # node_id:int -> WeakRef
 var _by_node: Dictionary = {} # instance_id:int -> node_id:int
 var _next_id: int = 1
-var _next_temp_id: int = -1
+# Client temporary ids are negatively numbered. -1 is reserved as the "no
+# temporary id" sentinel used by the wire protocol, so real temp ids start at -2.
+var _next_temp_id: int = -2
 
 
 func clear() -> void:
 	_by_id.clear()
 	_by_node.clear()
-	_next_id = 1
-	_next_temp_id = -1
+	# The counters are deliberately *not* reset: ids are unique for the whole
+	# session so a node created right after a snapshot clear cannot collide with
+	# an id that is still in flight (for example the snapshot's own node ids).
 
 
 ## Host-only: allocate the next authoritative id.

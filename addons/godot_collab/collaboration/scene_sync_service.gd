@@ -76,6 +76,11 @@ func attach_scene(root: Node, p_scene_id: String) -> void:
 	diff_watcher.base_revision = revision
 	diff_watcher.enabled = enabled
 	status.emit("Scene sync active (%d nodes tracked)." % node_ids.live_ids().size())
+	# A host that rebinds its scene while peers are connected must hand them the
+	# new authoritative content immediately; otherwise their cached node ids
+	# would no longer resolve. New peers still receive a snapshot on peer_ready.
+	if _coordinator.is_host() and _coordinator.session_manager != null and _coordinator.session_manager.is_active():
+		_send_snapshot_to(MultiplayerPeer.TARGET_PEER_BROADCAST)
 
 
 func detach_scene() -> void:

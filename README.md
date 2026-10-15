@@ -26,6 +26,8 @@ structured, validated operation protocol.
   (LAN-only vs. externally reachable vs. unverified).
 - Remote 3D cursors and usernames drawn in the editor viewport, with per-user
   colours, interpolation, rate limiting, and stale-state removal.
+- Live 3D `editorNodeVis` markers for each remote participant, so collaborators
+  see each other moving in the editor's 3D view in real time.
 - Host-authoritative scene operations: node create/remove/rename/reparent and
   `Node3D` transform plus a restricted set of Inspector properties.
 - Explicit **Save Shared Scene** and optional auto-save on the host.
