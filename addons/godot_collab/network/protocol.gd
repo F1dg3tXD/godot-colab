@@ -54,6 +54,11 @@ enum MessageType {
 	TRANSFER_COMPLETE = 64,
 	TRANSFER_CANCEL = 65,
 	TRANSFER_ERROR = 66,
+	# --- workspace (project file/scene) authoring ---
+	WORKSPACE_REQUEST = 70, ## client -> host: create scene / add file
+	WORKSPACE_RESULT = 71, ## host -> peers: accepted/rejected request
+	FILE_APPLY = 72, ## host -> peers: write this file content locally
+	SCENE_LIST = 73, ## host -> peers: known project scenes
 }
 
 ## Named reasons a peer can be rejected or an operation refused.
@@ -191,6 +196,43 @@ static func _validate_payload(type: MessageType, payload: Dictionary) -> String:
 		MessageType.TRANSFER_MANIFEST:
 			if not payload.has("files") or typeof(payload["files"]) != TYPE_ARRAY:
 				return "TRANSFER_MANIFEST missing files"
+		MessageType.WORKSPACE_REQUEST:
+			if not _has_keys(payload, ["request_id", "kind", "path"]):
+				return "WORKSPACE_REQUEST missing fields"
+			if not _check_int(payload, "request_id"):
+				return "WORKSPACE_REQUEST bad request_id"
+			if not _check_str(payload, "path", 512):
+				return "WORKSPACE_REQUEST bad path"
+			var wkind: Variant = payload["kind"]
+			if typeof(wkind) != TYPE_INT:
+				return "WORKSPACE_REQUEST bad kind"
+			if payload.has("text"):
+				if typeof(payload["text"]) != TYPE_STRING:
+					return "WORKSPACE_REQUEST bad text"
+				if (payload["text"] as String).to_utf8_buffer().size() > CollabConstants.MAX_WORKSPACE_FILE_BYTES:
+					return "WORKSPACE_REQUEST text too large"
+			if payload.has("root_class") and typeof(payload["root_class"]) != TYPE_STRING:
+				return "WORKSPACE_REQUEST bad root_class"
+		MessageType.WORKSPACE_RESULT:
+			if not _has_keys(payload, ["request_id", "ok", "path"]):
+				return "WORKSPACE_RESULT missing fields"
+			if not _check_str(payload, "path", 512):
+				return "WORKSPACE_RESULT bad path"
+		MessageType.FILE_APPLY:
+			if not _has_keys(payload, ["path", "data"]):
+				return "FILE_APPLY missing fields"
+			if not _check_str(payload, "path", 512):
+				return "FILE_APPLY bad path"
+			var fdata: Variant = payload["data"]
+			if typeof(fdata) != TYPE_PACKED_BYTE_ARRAY:
+				return "FILE_APPLY data not bytes"
+			if (fdata as PackedByteArray).size() > CollabConstants.MAX_WORKSPACE_FILE_BYTES:
+				return "FILE_APPLY exceeds workspace file limit"
+		MessageType.SCENE_LIST:
+			if not payload.has("scenes") or typeof(payload["scenes"]) != TYPE_ARRAY:
+				return "SCENE_LIST missing scenes"
+			if (payload["scenes"] as Array).size() > CollabConstants.MAX_SCENE_LIST:
+				return "SCENE_LIST too large"
 		_:
 			pass
 	return ""
@@ -212,8 +254,14 @@ static func _check_str(payload: Dictionary, key: String, max_len: int) -> bool:
 	return (v as String).length() <= max_len
 
 
+static func _check_int(payload: Dictionary, key: String) -> bool:
+	if not payload.has(key):
+		return false
+	return typeof(payload[key]) == TYPE_INT
+
+
 static func _type_count() -> int:
-	return MessageType.TRANSFER_ERROR + 1
+	return MessageType.SCENE_LIST + 1
 
 
 static func _append_u32(buf: PackedByteArray, value: int) -> void:

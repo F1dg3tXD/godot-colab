@@ -19,6 +19,10 @@ signal cancel_transfer_requested()
 signal snapshot_requested()
 signal snapshot_apply_requested()
 signal snapshot_discard_requested()
+signal new_scene_requested(path: String, root_class: String)
+signal add_file_requested(path: String, content: String)
+signal open_scene_requested(path: String)
+signal refresh_scenes_requested()
 signal username_changed(username: String)
 
 const MODE_HOST_WORKSPACE: int = 0
@@ -58,9 +62,21 @@ var _download_button: Button
 var _cancel_button: Button
 var _save_button: Button
 var _snapshot_button: Button
+var _scene_list: ItemList
+var _open_scene_button: Button
+var _refresh_scenes_button: Button
+var _new_scene_button: Button
+var _add_file_button: Button
+var _new_scene_dialog: ConfirmationDialog
+var _new_scene_path: LineEdit
+var _new_scene_root: OptionButton
+var _add_file_dialog: ConfirmationDialog
+var _add_file_path: LineEdit
+var _add_file_content: TextEdit
 var _messages: RichTextLabel
 var _requests: Array = [] # [{peer_id, name}]
 var _participants: Array = []
+var _scenes: Array = []
 
 
 func setup(settings: CollabSettings) -> void:
@@ -259,6 +275,42 @@ func _build() -> void:
 	_progress_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	project_box.add_child(_progress_label)
 
+	var workspace_box := _section("Project scenes & authoring")
+	var scene_list_label := Label.new()
+	scene_list_label.text = "Scenes advertised by the host"
+	scene_list_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	workspace_box.add_child(scene_list_label)
+	_scene_list = ItemList.new()
+	_scene_list.custom_minimum_size = Vector2(0, 90)
+	_scene_list.allow_reselect = true
+	workspace_box.add_child(_scene_list)
+	var scene_actions := HBoxContainer.new()
+	_open_scene_button = Button.new()
+	_open_scene_button.text = "Open selected"
+	_open_scene_button.tooltip_text = "Open the selected scene locally (loads the local copy of the file)."
+	_open_scene_button.pressed.connect(_on_open_scene_pressed)
+	scene_actions.add_child(_open_scene_button)
+	_refresh_scenes_button = Button.new()
+	_refresh_scenes_button.text = "Refresh"
+	_refresh_scenes_button.pressed.connect(func() -> void: refresh_scenes_requested.emit())
+	scene_actions.add_child(_refresh_scenes_button)
+	workspace_box.add_child(scene_actions)
+	var author_row := HBoxContainer.new()
+	_new_scene_button = Button.new()
+	_new_scene_button.text = "New scene..."
+	_new_scene_button.tooltip_text = "Ask the host to create a new empty scene in the shared workspace."
+	_new_scene_button.pressed.connect(_on_new_scene_pressed)
+	author_row.add_child(_new_scene_button)
+	_add_file_button = Button.new()
+	_add_file_button.text = "Add file..."
+	_add_file_button.tooltip_text = "Ask the host to add a text file (script/resource) to the shared workspace."
+	_add_file_button.pressed.connect(_on_add_file_pressed)
+	author_row.add_child(_add_file_button)
+	workspace_box.add_child(author_row)
+
+	_build_new_scene_dialog()
+	_build_add_file_dialog()
+
 	var messages_box := _section("Messages")
 	_messages = RichTextLabel.new()
 	_messages.bbcode_enabled = true
@@ -266,6 +318,68 @@ func _build() -> void:
 	_messages.scroll_active = false
 	_messages.custom_minimum_size = Vector2(0, 60)
 	messages_box.add_child(_messages)
+
+
+func _build_new_scene_dialog() -> void:
+	_new_scene_dialog = ConfirmationDialog.new()
+	_new_scene_dialog.title = "Create a new scene"
+	_new_scene_dialog.ok_button_text = "Create scene"
+	var box := VBoxContainer.new()
+	var path_row := HBoxContainer.new()
+	var path_label := Label.new()
+	path_label.text = "Path"
+	path_label.custom_minimum_size = Vector2(72, 0)
+	path_row.add_child(path_label)
+	_new_scene_path = LineEdit.new()
+	_new_scene_path.placeholder_text = "res://scenes/new_scene.tscn"
+	_new_scene_path.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_new_scene_path.text = "res://new_scene.tscn"
+	path_row.add_child(_new_scene_path)
+	box.add_child(path_row)
+	var root_row := HBoxContainer.new()
+	var root_label := Label.new()
+	root_label.text = "Root"
+	root_label.custom_minimum_size = Vector2(72, 0)
+	root_row.add_child(root_label)
+	_new_scene_root = OptionButton.new()
+	for root_class in CollabConstants.SCENE_ROOT_CLASSES:
+		_new_scene_root.add_item(root_class)
+		if root_class == "Node3D":
+			_new_scene_root.selected = _new_scene_root.item_count - 1
+	root_row.add_child(_new_scene_root)
+	box.add_child(root_row)
+	_new_scene_dialog.add_child(box)
+	_new_scene_dialog.confirmed.connect(_on_new_scene_confirmed)
+	add_child(_new_scene_dialog)
+
+
+func _build_add_file_dialog() -> void:
+	_add_file_dialog = ConfirmationDialog.new()
+	_add_file_dialog.title = "Add a project file"
+	_add_file_dialog.ok_button_text = "Add file"
+	_add_file_dialog.min_size = Vector2(520, 420)
+	var box := VBoxContainer.new()
+	var path_row := HBoxContainer.new()
+	var path_label := Label.new()
+	path_label.text = "Path"
+	path_label.custom_minimum_size = Vector2(72, 0)
+	path_row.add_child(path_label)
+	_add_file_path = LineEdit.new()
+	_add_file_path.placeholder_text = "res://scripts/new_script.gd"
+	_add_file_path.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	path_row.add_child(_add_file_path)
+	box.add_child(path_row)
+	var content_label := Label.new()
+	content_label.text = "Content"
+	box.add_child(content_label)
+	_add_file_content = TextEdit.new()
+	_add_file_content.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	_add_file_content.custom_minimum_size = Vector2(0, 240)
+	_add_file_content.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
+	box.add_child(_add_file_content)
+	_add_file_dialog.add_child(box)
+	_add_file_dialog.confirmed.connect(_on_add_file_confirmed)
+	add_child(_add_file_dialog)
 
 
 func _section(title_text: String) -> VBoxContainer:
@@ -356,6 +470,39 @@ func _on_download_pressed() -> void:
 	if _settings != null:
 		_settings.set_value(CollabSettings.KEY_TRANSFER_DIR, root)
 	download_requested.emit(root)
+
+
+func _on_new_scene_pressed() -> void:
+	_new_scene_dialog.popup_centered(Vector2i(420, 150))
+
+
+func _on_new_scene_confirmed() -> void:
+	var path: String = _new_scene_path.text.strip_edges()
+	if path.is_empty():
+		push_message("Enter a scene path.", true)
+		return
+	new_scene_requested.emit(path, _new_scene_root.get_item_text(_new_scene_root.selected))
+
+
+func _on_add_file_pressed() -> void:
+	_add_file_dialog.popup_centered(Vector2i(560, 460))
+
+
+func _on_add_file_confirmed() -> void:
+	var path: String = _add_file_path.text.strip_edges()
+	if path.is_empty():
+		push_message("Enter a file path.", true)
+		return
+	add_file_requested.emit(path, _add_file_content.text)
+
+
+func _on_open_scene_pressed() -> void:
+	var selected: PackedInt32Array = _scene_list.get_selected_items()
+	if selected.is_empty():
+		push_message("Select a scene to open.", true)
+		return
+	var entry: String = _scene_list.get_item_text(selected[0])
+	open_scene_requested.emit(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +598,15 @@ func set_project_status(text: String) -> void:
 func set_save_status(text: String) -> void:
 	if _save_label != null:
 		_save_label.text = "Save: %s" % text
+
+
+func set_scenes(scenes: Array) -> void:
+	_scenes = scenes
+	if _scene_list == null:
+		return
+	_scene_list.clear()
+	for scene in scenes:
+		_scene_list.add_item(str(scene))
 
 
 func set_transfer_progress(text: String) -> void:

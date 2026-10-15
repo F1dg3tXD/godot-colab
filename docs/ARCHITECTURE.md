@@ -39,8 +39,10 @@ someone maintaining the add-on, not at end users.
 | `CollabMarkerManager` | `presence/marker_manager.gd` | Spawns/updates/removes a live 3D `editorNodeVis` marker per remote participant in the editor viewport. |
 | `CollabSceneOperations` | `collaboration/scene_operations.gd` | Builds and validates structured scene operations. |
 | `CollabNodeIdMap` | `collaboration/node_id_map.gd` | Stable session-level node IDs ↔ local `Node` mapping. |
-| `CollabDiffWatcher` | `collaboration/diff_watcher.gd` | Debounced snapshot/diff watcher for supported editor changes. |
-| `CollabSceneSyncService` | `collaboration/scene_sync_service.gd` | Applies/creates/broadcasts operations, snapshots, revision checks, conflict notices. |
+| `CollabDiffWatcher` | `collaboration/diff_watcher.gd` | Per-context debounced snapshot/diff watcher for supported editor changes. |
+| `CollabSceneContext` | `collaboration/scene_context.gd` | Per-scene state (root, node-id map, diff watcher, revision, detached/dirty flags). |
+| `CollabSceneSyncService` | `collaboration/scene_sync_service.gd` | Multi-scene operation apply/create/broadcast, scene-scoped snapshots, revision checks, conflict notices, host-side persistence. |
+| `CollabWorkspaceService` | `collaboration/workspace_service.gd` | Host-authoritative scene creation and file authoring + scene listing, with path/size/extension validation. |
 | `CollabSaveService` | `collaboration/save_service.gd` | Explicit + auto save of the shared scene on the host. |
 | `CollabProjectManifest` | `project_transfer/project_manifest.gd` | Eligible-file manifest with sizes and checksums. |
 | `CollabTransferManager` | `project_transfer/transfer_manager.gd` | Chunked, checksummed, cancellable snapshot download; safe writes. |
@@ -67,11 +69,12 @@ plugin.gd ──────────────► CollabSessionCoordinator
    │            ▼                    └────── CollabProtocol (frame/decode/validate)
    │     _forward_3d_gui_input
    │     _forward_3d_draw_over_viewport
-   └── CollabSceneSyncService / CollabSaveService / CollabTransferManager
+    └── CollabSceneSyncService / CollabSaveService / CollabTransferManager / CollabWorkspaceService
 ```
 
 `plugin.gd` polls `CollabSessionManager`, `CollabSceneSyncService`,
-`CollabSaveService` and `CollabTransferManager` every editor frame. Networking
+`CollabSaveService` and `CollabTransferManager` every editor frame (the
+workspace service is event-driven and needs no poll). Networking
 and UI never call each other directly: the coordinator emits signals that
 `plugin.gd` translates into dock updates, and the dock emits signals that
 `plugin.gd` translates into coordinator calls.
@@ -103,6 +106,9 @@ Scene: `OPS`, `OPS_ACK`, `OPS_REJECT`, `SNAPSHOT_REQUEST/RESPONSE`,
 Saving: `SAVE_REQUEST`, `SAVE_RESULT`.
 Transfer: `TRANSFER_MANIFEST`, `TRANSFER_REQUEST`, `TRANSFER_CHUNK`,
 plus completion/error types.
+Workspace authoring: `WORKSPACE_REQUEST` (client → host: create scene / add
+file / list scenes), `WORKSPACE_RESULT` (host → peers: accept/reject),
+`FILE_APPLY` (host → peers: canonical file bytes), `SCENE_LIST`.
 
 Best-effort traffic (cursor updates) uses `TRANSFER_MODE_UNRELIABLE_ORDERED`;
 everything else uses `TRANSFER_MODE_RELIABLE`. Control and file-transfer data
@@ -133,8 +139,21 @@ from submitting scene or transfer work.
 Godot does not replicate arbitrary editor changes automatically, and repeatedly
 overwriting whole `.tscn` files is not an acceptable design. Instead:
 
+- Collaboration is **scene-scoped**. The plugin binds a `CollabSceneContext` for
+  **every open scene root** (`EditorInterface.get_open_scene_roots()`), not just
+  the focused tab, and each operation carries the `res://` scene path it
+  belongs to (`scene_id`). Switching tabs therefore never re-targets the shared
+  scene and never pushes a snapshot that could clobber another scene. The
+  focused scene is tracked separately for presence/cursor purposes and broadcast
+  with `SCENE_FOCUS`.
+- When an operation arrives for a scene the host does not have open, the host
+  loads a **detached** model from disk (`CollabSceneContext.detached = true`),
+  applies the operation there, and writes it back, so client work is applied and
+  persisted even if the host is looking at a different scene. Detached contexts
+  are replaced by a bound context if the host later opens that scene.
 - A **stable session node id** is assigned per node and mapped to the local node
-  by `CollabNodeIdMap`. Operations reference these ids, not paths, so renames
+  by `CollabNodeIdMap`. Each node-id map is owned by a scene context, so ids are
+  scoped to their scene. Operations reference these ids, not paths, so renames
   and reparents do not break references.
 - **Id allocation policy.** Authoritative ids are positive and host-assigned. The
   editor binds the edited scene when the plugin enables (before any session
@@ -154,25 +173,39 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
   reparent, `Node3D` transform (position/rotation/scale), and a restricted set
   of common Inspector properties. Resource references are represented by
   validated resource paths or explicitly supported serialized values.
-- The host validates each operation against the current scene revision and
-  node-id map, applies accepted operations to the live edited scene using
-  editor-safe mechanisms, bumps the revision, and broadcasts. Rejected
-  operations produce `OPS_REJECT` / `RESYNC_REQUIRED` / `CONFLICT_NOTICE` with a
-  reason.
-- A **diff watcher** (`collaboration/diff_watcher.gd`) periodically scans the
-  attached scene for supported changes with debouncing, to catch edits made
-  through editor panels that do not emit a reliable general-purpose event. It
-  is bounded to supported property/node types for performance.
+- The host validates each operation against the target scene's context and
+  revision, applies accepted operations to that scene (live root when open,
+  detached model otherwise) using editor-safe mechanisms, bumps that scene's
+  revision, and broadcasts. Rejected operations produce `OPS_REJECT` /
+  `RESYNC_REQUIRED` / `CONFLICT_NOTICE` with a reason.
+- A per-context **diff watcher** (`collaboration/diff_watcher.gd`) periodically
+  scans each bound scene for supported changes with debouncing, to catch edits
+  made through editor panels that do not emit a reliable general-purpose event.
+  It is bounded to supported property/node types for performance. A context's
+  baseline is refreshed immediately after remote operations are applied, so a
+  remote change is never echoed back as a new local operation.
 
 ### Conflict policy
 
 The host is authoritative. Changes are ordered by accepted operation order and
 the scene revision at which they were applied. When two peers edit the same
 property concurrently, the host accepts operations in the order it receives
-them; each accepted operation bumps the revision and is broadcast. An operation
-whose base revision cannot be reconciled is rejected and the sender is told to
-resynchronize (snapshot). The host never silently drops a rejected operation —
-it reports a conflict/error to the dock.
+them; each accepted operation bumps that scene's revision and is broadcast. An
+operation whose base revision cannot be reconciled is rejected and the sender is
+told to resynchronize (snapshot). The host never silently drops a rejected
+operation — it reports a conflict/error to the dock. Revisions are tracked
+per scene, so activity in one scene does not invalidate operations in another.
+
+### Host persistence of remote edits
+
+Because the host owns the workspace, accepted remote edits must survive even if
+the host never focuses the scene or clicks save. After applying remote
+operations to a context, the sync service marks it dirty. `poll()` writes dirty
+contexts back to disk (`PackedScene.pack` + `ResourceSaver.save`) after
+`PERSIST_DEBOUNCE_MS` (1.2 s) of inactivity when the context is detached or is
+not the focused tab. The explicit **Save shared scene** action first calls
+`CollabSceneSyncService.persist_host_scenes()` (all dirty contexts) and then the
+editor's own save for the focused scene via `CollabSaveService`.
 
 ### Resynchronization
 
@@ -184,15 +217,39 @@ replaces the local children of the edited root with the host's tree, so both
 peers converge on the same node ids and structure.
 
 A peer may also request a snapshot at any time (`SNAPSHOT_REQUEST`); the host
-answers with `SNAPSHOT_RESPONSE`. When `auto_apply_snapshot` is enabled (the
-default in host-workspace mode) the peer applies an incoming snapshot
-immediately, because the host owns the authoritative scene. Turning it off makes
-the receiver hold the snapshot as *pending* until explicitly applied
-(`apply_pending_snapshot` / `discard_pending_snapshot`); a snapshot that cannot
-be applied (no scene open, or a different scene) is kept pending and reported
-rather than cleared. Rejected operations are reported to the dock but no longer
-force a snapshot on their own, so a peer's local-only edit (for example an
-unsupported node type) is never silently wiped.
+answers with `SNAPSHOT_RESPONSE` for that peer's `scene_id`. When the peer is on
+a scene the host does not have open, the host loads a detached copy from disk to
+serve the snapshot. When `auto_apply_snapshot` is enabled (the default in
+host-workspace mode) the peer applies an incoming snapshot immediately, because
+the host owns the authoritative scene. Turning it off makes the receiver hold the
+snapshot as *pending* until explicitly applied (`apply_pending_snapshot` /
+`discard_pending_snapshot`); a snapshot that cannot be applied (no scene open, or
+a different scene) is kept pending and reported rather than cleared. Rejected
+operations are reported to the dock but no longer force a snapshot on their own,
+so a peer's local-only edit (for example an unsupported node type) is never
+silently wiped.
+
+## Workspace authoring (new scenes and added files)
+
+In host-workspace mode a collaborator can create a new scene or add a text
+project file (`CollabWorkspaceService`):
+
+1. The requester validates the path locally with `CollabPathGuard` and a strict
+   extension allow-list (`WRITABLE_EXTENSIONS`) and size cap
+   (`MAX_WORKSPACE_FILE_BYTES = 512 KiB`).
+2. The host re-validates everything (path traversal / symlink escape, extension,
+   size, scene root class against `SCENE_ROOT_CLASSES`, existing-file policy) and
+   writes the file **inside the approved project root only**.
+3. The host broadcasts the canonical bytes with `FILE_APPLY`, so every peer
+   writes its own local copy, and refreshes the editor filesystem
+   (`EditorFileSystem.update_file`) and re-advertises `SCENE_LIST`.
+
+Files delivered this way are never executed or imported by the add-on; they
+become ordinary project files the user's editor may scan. Binary/generated
+assets are out of scope for this path and belong to project transfer.
+
+Setting `godot_collab/collaboration/allow_workspace_authoring` (default on)
+gates the whole feature; it is always disabled in Git presence mode.
 
 ## Presence and remote cursors
 
@@ -240,9 +297,9 @@ unsupported node type) is never silently wiped.
 Preferences are stored under `godot_collab/*` in the editor's `EditorSettings`
 (see `core/collab_settings.gd`): username, default port, max peers, rendezvous
 URL, direct advertise host, UPnP toggle, cursor label/size/depth, auto-save +
-delay, download directory, per-file/total transfer limits, join approval, and
-invite-token requirement. Session tokens are never written to committed project
-files.
+delay, download directory, per-file/total transfer limits, join approval,
+invite-token requirement, and workspace authoring. Session tokens are never
+written to committed project files.
 
 ## Lifecycle
 

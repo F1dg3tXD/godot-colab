@@ -18,6 +18,8 @@ signal cursor_received(peer_id: int, payload: Dictionary)
 signal scene_message(peer_id: int, type: int, payload: Dictionary)
 signal save_message(peer_id: int, type: int, payload: Dictionary)
 signal transfer_message(peer_id: int, type: int, payload: Dictionary)
+signal workspace_message(peer_id: int, type: int, payload: Dictionary)
+signal scene_focus_changed(peer_id: int, scene_id: String)
 signal compatibility_warning(text: String)
 signal notice(text: String)
 signal error_raised(text: String)
@@ -42,6 +44,13 @@ const TRANSFER_MESSAGE_TYPES: Array[int] = [
 	CollabProtocol.MessageType.TRANSFER_COMPLETE,
 	CollabProtocol.MessageType.TRANSFER_CANCEL,
 	CollabProtocol.MessageType.TRANSFER_ERROR,
+]
+
+const WORKSPACE_MESSAGE_TYPES: Array[int] = [
+	CollabProtocol.MessageType.WORKSPACE_REQUEST,
+	CollabProtocol.MessageType.WORKSPACE_RESULT,
+	CollabProtocol.MessageType.FILE_APPLY,
+	CollabProtocol.MessageType.SCENE_LIST,
 ]
 
 var session_manager: CollabSessionManager
@@ -241,12 +250,16 @@ func _on_message(from_peer: int, type: CollabProtocol.MessageType, payload: Dict
 		participants_changed.emit()
 	elif t == CollabProtocol.MessageType.CURSOR_UPDATE:
 		_on_cursor(from_peer, payload)
+	elif t == CollabProtocol.MessageType.SCENE_FOCUS:
+		_on_scene_focus(from_peer, payload)
 	elif SCENE_MESSAGE_TYPES.has(t):
 		scene_message.emit(from_peer, t, payload)
 	elif t == CollabProtocol.MessageType.SAVE_REQUEST or t == CollabProtocol.MessageType.SAVE_RESULT:
 		save_message.emit(from_peer, t, payload)
 	elif TRANSFER_MESSAGE_TYPES.has(t):
 		transfer_message.emit(from_peer, t, payload)
+	elif WORKSPACE_MESSAGE_TYPES.has(t):
+		workspace_message.emit(from_peer, t, payload)
 
 
 func _on_hello(peer_id: int, payload: Dictionary) -> void:
@@ -371,6 +384,26 @@ func _on_cursor(from_peer: int, payload: Dictionary) -> void:
 		cursor_received.emit(int(payload.get("source_peer", from_peer)), payload)
 
 
+## Tracks which scene each participant is currently focused on so the host can
+## route snapshots and report scene mismatches. The host relays client focus
+## changes to the rest of the session.
+func _on_scene_focus(from_peer: int, payload: Dictionary) -> void:
+	if not is_admitted(from_peer):
+		return
+	var scene: String = str(payload.get("scene_id", ""))
+	var participant: CollabParticipant = registry.get_participant(from_peer)
+	if participant != null:
+		participant.scene_id = scene
+	if _is_host:
+		session_manager.broadcast(CollabProtocol.MessageType.SCENE_FOCUS, {
+			"peer_id": from_peer,
+			"username": participant.username if participant != null else "",
+			"scene_id": scene,
+		}, true, 0, from_peer)
+	scene_focus_changed.emit(from_peer, scene)
+	participants_changed.emit()
+
+
 func _on_peer_connected(peer_id: int) -> void:
 	if _is_host:
 		return # Wait for HELLO before admitting.
@@ -446,6 +479,25 @@ func send_transfer(type: CollabProtocol.MessageType, payload: Dictionary) -> voi
 
 func send_transfer_to(peer_id: int, type: CollabProtocol.MessageType, payload: Dictionary) -> void:
 	send_scene_to(peer_id, type, payload)
+
+
+func send_workspace(type: CollabProtocol.MessageType, payload: Dictionary) -> void:
+	send_scene(type, payload)
+
+
+func send_workspace_to(peer_id: int, type: CollabProtocol.MessageType, payload: Dictionary) -> void:
+	send_scene_to(peer_id, type, payload)
+
+
+## Announces the scene this peer is focused on.
+func send_scene_focus(p_scene_id: String) -> void:
+	if session_manager == null or not session_manager.is_active():
+		return
+	var payload := {"peer_id": _local_peer_id, "username": _username(), "scene_id": p_scene_id}
+	if _is_host:
+		session_manager.broadcast(CollabProtocol.MessageType.SCENE_FOCUS, payload)
+	else:
+		session_manager.send_to_server(CollabProtocol.MessageType.SCENE_FOCUS, payload)
 
 
 func refresh_host_scene_id() -> void:

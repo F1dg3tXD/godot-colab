@@ -9,7 +9,9 @@ extends RefCounted
 ## Wire protocol version. Bump whenever the packet format changes in a way
 ## that older peers cannot understand. Peers with a different version are
 ## rejected during the handshake instead of being allowed to desync.
-const PROTOCOL_VERSION: int = 1
+## v2: scene operations are scene-id aware, and workspace (file/scene) requests
+## and scene-focus broadcasts were added.
+const PROTOCOL_VERSION: int = 2
 
 ## Magic marker placed at the front of every packet so garbage/foreign traffic
 ## is discarded before it reaches the decoder. Declared as a static var because
@@ -54,6 +56,32 @@ const CURSOR_INTERP_SECONDS: float = 0.09
 
 ## Maximum size of a single inbound control message (ops, snapshot headers...).
 const MAX_OPS_PER_MESSAGE: int = 256
+
+## Hard upper bound for a single workspace file/scene payload (create scene or
+## add file). Larger files must use the project transfer path.
+const MAX_WORKSPACE_FILE_BYTES: int = 512 * 1024 # 512 KiB
+
+## Upper bound on the number of scenes advertised in a SCENE_LIST message.
+const MAX_SCENE_LIST: int = 2048
+
+## File extensions a peer may create or overwrite through the workspace service.
+## Deliberately text-oriented: generated/binary assets use project transfer.
+const WRITABLE_EXTENSIONS: Array[String] = [
+	".tscn", ".tres", ".gd", ".gdshader", ".shader", ".gdshaderinc",
+	".json", ".txt", ".cfg", ".md", ".csv", ".xml", ".import",
+]
+
+## Node classes that may be used as the root of a newly created scene.
+const SCENE_ROOT_CLASSES: Array[String] = [
+	"Node", "Node2D", "Node3D", "Control", "CanvasLayer",
+]
+
+## Workspace request kinds understood by the host.
+enum WorkspaceOp {
+	CREATE_SCENE = 0, ## Create a new (empty) scene file.
+	ADD_FILE = 1, ## Create or overwrite a text file inside the project.
+	LIST_SCENES = 2, ## Ask the host to re-advertise the project's scenes.
+}
 
 ## Supported collaboration modes for a session.
 enum WorkspaceMode {

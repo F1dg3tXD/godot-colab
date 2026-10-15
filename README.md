@@ -30,7 +30,15 @@ structured, validated operation protocol.
   see each other moving in the editor's 3D view in real time.
 - Host-authoritative scene operations: node create/remove/rename/reparent and
   `Node3D` transform plus a restricted set of Inspector properties.
-- Explicit **Save Shared Scene** and optional auto-save on the host.
+- **Multi-scene collaboration.** Every open scene is tracked independently, so
+  collaborators can work in different scenes at once and the host switching tabs
+  never reverts anyone's edits. Changes to a scene the host is not viewing are
+  applied and persisted on the host.
+- **Workspace authoring.** Collaborators can ask the host to create a new scene
+  or add a text project file; the host validates it (path/size/extension) and
+  distributes a local copy to every peer.
+- Explicit **Save Shared Scene** (persists remote edits, then saves the focused
+  scene) and optional auto-save on the host.
 - Host-owned project snapshot download (chunked, checksummed, path-safe) that
   builds a local project copy.
 - **Git presence mode**: presence + cursors only, for users who already share a
@@ -91,7 +99,7 @@ addons/godot_collab/
   network/                     wire protocol, ENet session manager, participants
   session/                     session coordinator, invite codes, rendezvous, UPnP, connectivity
   presence/                    local/remote cursor sampling and overlay drawing
-  collaboration/               scene ops, node-id mapping, diff watcher, save service
+  collaboration/               per-scene sync contexts, scene ops, node-id mapping, diff watcher, save + workspace authoring
   project_transfer/            project manifest + chunked transfer manager
   security/                    path validation + rate limiting
   ui/                          editor dock

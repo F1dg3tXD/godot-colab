@@ -30,6 +30,7 @@ const KEY_MAX_FILE_MB: String = SETTING_ROOT + "/transfer/max_file_mb"
 const KEY_MAX_TOTAL_MB: String = SETTING_ROOT + "/transfer/max_total_mb"
 const KEY_APPROVE_JOINS: String = SETTING_ROOT + "/security/approve_joins"
 const KEY_REQUIRE_TOKEN: String = SETTING_ROOT + "/security/require_invite_token"
+const KEY_ALLOW_WORKSPACE_AUTHORING: String = SETTING_ROOT + "/collaboration/allow_workspace_authoring"
 
 var _settings: Object = null # EditorSettings when available, else null.
 var _memory: Dictionary = {}
@@ -63,6 +64,7 @@ func register_defaults() -> void:
 	_register(KEY_MAX_TOTAL_MB, 512, TYPE_INT, "Maximum total size of a project download (MiB).", 1, 32768)
 	_register(KEY_APPROVE_JOINS, true, TYPE_BOOL, "Require the host to approve each participant before granting workspace access.")
 	_register(KEY_REQUIRE_TOKEN, true, TYPE_BOOL, "Require the session token embedded in the invitation code. Disable only for trusted LAN testing.")
+	_register(KEY_ALLOW_WORKSPACE_AUTHORING, true, TYPE_BOOL, "Allow collaborators to create scenes and add files to the host workspace.")
 
 
 func get_string(key: String, default: String = "") -> String:

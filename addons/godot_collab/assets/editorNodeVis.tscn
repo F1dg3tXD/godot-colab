@@ -20,6 +20,14 @@ font_color = Color(1, 0, 0, 0.6)
 outline_size = 10
 outline_color = Color(0, 0, 0, 1)
 
+[sub_resource type="SpriteFrames" id="SpriteFrames_qjxf3"]
+animations = [{
+"frames": [],
+"loop": 1,
+"name": &"idle",
+"speed": 5.0
+}]
+
 [node name="EditorNodeVis" type="Node3D" unique_id=1689922859]
 script = ExtResource("1_tnv6x")
 
@@ -32,12 +40,14 @@ rings = 16
 
 [node name="CSGCylinder3D" type="CSGCylinder3D" parent="CSGSphere3D" unique_id=1570029731]
 transform = Transform3D(1, 0, 0, 0, -4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0.6926599)
+visible = false
 radius = 0.05
 height = 0.5
 sides = 16
 
 [node name="CSGPolygon3D" type="CSGPolygon3D" parent="CSGSphere3D/CSGCylinder3D" unique_id=374779098]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.2212109, -9.669439e-09)
+visible = false
 polygon = PackedVector2Array(0, 0, 0, 0.3, 0.1, 0)
 mode = 1
 spin_degrees = 360.0
@@ -71,3 +81,10 @@ label_settings = SubResource("LabelSettings_tnv6x")
 horizontal_alignment = 1
 vertical_alignment = 1
 autowrap_mode = 3
+
+[node name="Cursor" type="Node3D" parent="." unique_id=1606338959]
+visible = false
+
+[node name="AnimatedSprite3D" type="AnimatedSprite3D" parent="Cursor" unique_id=1461985635]
+sprite_frames = SubResource("SpriteFrames_qjxf3")
+animation = &"idle"

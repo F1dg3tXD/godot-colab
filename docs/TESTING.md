@@ -14,17 +14,20 @@ cd /path/to/godot-colab
 - Exit code `1` with `RESULT: FAIL` means at least one check failed; each failure
   is printed individually.
 - The suite covers: protocol framing/validation (bad magic, truncated packets,
-  oversized payloads, non-dictionary payloads), invitation code encode/decode,
-  path guard (traversal/absolute/symlink), rate limiter, node-id allocation
-  (positive authoritative ids, `-1` sentinel avoidance, no id reuse after
-  `clear()`), marker scene instantiation with username/colour application and
-  no-op default colour, a `CollabMarkerManager` check (marker created for a
-  remote cursor, parented into the viewport container, removed when the cursor
-  disappears or the peer is in another scene), an ENet loopback host/client
-  handshake with cursor relay and host-disconnect detection, and a two-scene
-  loopback test where a host scene is snapshotted to a joining peer and
+  oversized payloads, non-dictionary payloads, and the workspace message types
+  `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/`SCENE_LIST`), invitation
+  code encode/decode, path guard (traversal/absolute/symlink), rate limiter,
+  node-id allocation (positive authoritative ids, `-1` sentinel avoidance, no id
+  reuse after `clear()`), marker scene instantiation with username/colour
+  application and no-op default colour, a `CollabMarkerManager` check (marker
+  created for a remote cursor, parented into the viewport container, removed when
+  the cursor disappears or the peer is in another scene), an ENet loopback
+  host/client handshake with cursor relay and host-disconnect detection, a
+  two-scene loopback test where a host scene is snapshotted to a joining peer and
   host/peer create/remove/transform edits propagate both ways without id
-  collisions or duplicated nodes.
+  collisions or duplicated nodes, and a **multi-scene isolation** test where the
+  host is focused on scene B while a client edits scene A (the edit must reach A,
+  not B).
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -99,6 +102,19 @@ instances, enable **Godot Collab** in each, and run through the checks:
    conflict/reject notice, not a silent drop.
 9. **Save persists.** On the host, click **Save Shared Scene**. Restart the
    editor and reopen the scene; verify the accepted changes are present.
+9a. **Multi-scene: host on a different tab.** With a session running, open two
+    scenes in the host editor (A and B) and focus B. In the client, edit scene A
+    (move a node). Verify the change appears in A on the host and that B is
+    untouched. Switch the host focus back to A; the client's change must still be
+    there (it must not be reverted by the tab switch). Close A on the host, edit
+    A again from the client, and verify the host writes it to disk; reopen A and
+    confirm the change is present.
+9b. **Workspace authoring.** From the client dock, use **New scene...** to
+    create `res://scenes/test_from_client.tscn` and **Add file...** to add a
+    small `.gd` file. Confirm both peers receive the files (the client's local
+    copy appears, and the host's Project filesystem refreshes). Use **Open
+    selected** to open the new scene. Confirm a path with `..`, an absolute path,
+    or a disallowed extension is rejected.
 10. **Project download + checksum.** From the client, request a project
     download to an approved empty directory. Verify progress, completion, that
     `project.godot` and required files exist, and that no checksum errors are

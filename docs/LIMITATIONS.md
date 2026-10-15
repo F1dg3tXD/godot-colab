@@ -7,10 +7,11 @@ are listed explicitly so nothing here is mistaken for working functionality.
 ## Verification status
 
 - The headless test suite (`addons/godot_collab/tests/run_tests.gd`) covers the
-  protocol framing/validation, invitation codes, path guard, rate limiter, an
-  ENet loopback handshake/cursor/disconnect flow, and a two-scene loopback
-  snapshot/host<->peer edit-propagation flow. It passes (see
-  [`TESTING.md`](TESTING.md)).
+  protocol framing/validation (including the workspace message types), invitation
+  codes, path guard, rate limiter, an ENet loopback handshake/cursor/disconnect
+  flow, a two-scene loopback snapshot/host<->peer edit-propagation flow, and a
+  **multi-scene isolation** flow (host focused on scene B while a client edits
+  scene A). It passes (see [`TESTING.md`](TESTING.md)).
 - The interactive editor behaviours (dock UI, remote cursor drawing,
   `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene editing,
   saving, project download, approval prompts) require **two interactive Godot
@@ -63,6 +64,15 @@ are listed explicitly so nothing here is mistaken for working functionality.
   path on each peer; otherwise the node is created without its script.
 - Conflict handling is deterministic (host order + revision) but is not a full
   CRDT/operational-transform system.
+- Revisions are tracked **per scene**. A peer and the host can be working on
+  different open scenes simultaneously; operations are routed by scene path.
+- Host-side persistence of remote edits rewrites the scene file on the host
+  (after a debounce, for scenes the host is not focused on, or when the host uses
+  *Save shared scene*). The editor's open tab is not force-reloaded; the on-disk
+  and in-memory copies are kept in sync because the same root was edited.
+- A detached host context is a plain model loaded from disk. It has no editor
+  environment, so editor-only side effects (for example `@tool` `_ready` logic
+  that expects the edited scene) do not run for it.
 
 ## Presence and cursors
 
@@ -79,11 +89,29 @@ are listed explicitly so nothing here is mistaken for working functionality.
 
 ## Saving
 
-- The host saves the **currently active** edited scene via
-  `EditorInterface.save_scene()`. Other open scenes and project files are not
-  saved by a shared-save command.
+- The explicit **Save shared scene** action first persists every scene with
+  unpersisted remote edits, then saves the **currently active** edited scene via
+  `EditorInterface.save_scene()`. Scenes with no remote edits and no local
+  changes are not force-saved.
+- Remote edits to a scene the host is not focused on are written back after a
+  short debounce (1.2 s) so they survive even if the host never clicks save.
+  This is a file write to the host's own scene path, not a transactional save.
 - Auto-save is optional and time-based (after an inactivity period), not a
   robust transactional save.
+
+## Workspace authoring (new scenes / added files)
+
+- Only **text** files with an allowed extension
+  (`WRITABLE_EXTENSIONS`) are accepted, up to `MAX_WORKSPACE_FILE_BYTES`
+  (512 KiB). Larger files or binary assets must use project transfer.
+- New scenes are limited to the root classes in `SCENE_ROOT_CLASSES`
+  (`Node`, `Node2D`, `Node3D`, `Control`, `CanvasLayer`) and are created empty.
+- Transferred files are written to disk but are **never executed or imported** by
+  the add-on; the editor may scan them like any project file.
+- The scene list is a directory scan of `res://` and is capped at
+  `MAX_SCENE_LIST` (2048) entries; generated/hidden folders are skipped.
+- Workspace authoring is disabled in Git presence mode and can be turned off with
+  `godot_collab/collaboration/allow_workspace_authoring`.
 
 ## Project download
 

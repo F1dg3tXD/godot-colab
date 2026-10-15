@@ -20,14 +20,16 @@ var _presence: CollabPresenceService
 var _markers: CollabMarkerManager
 var _scene_sync: CollabSceneSyncService
 var _save_service: CollabSaveService
+var _workspace: CollabWorkspaceService
 var _transfer: CollabTransferManager
 var _rendezvous: CollabRendezvousClient
 var _upnp: CollabUpnpForwarder
 
 var _dock: CollabDock
 
-var _attached_root: Node = null
 var _attached_scene_id: String = ""
+var _bound_scene_ids: Dictionary = {}
+var _last_focus_sent: String = ""
 var _project_id_cache: String = ""
 var _scene_dirty: bool = false
 var _upnp_attempted: bool = false
@@ -74,6 +76,7 @@ func _enter_tree() -> void:
 		"save_scene": Callable(self, "_save_scene"),
 		"get_edited_scene_path": Callable(self, "_edited_scene_path"),
 		"is_scene_modified": Callable(self, "_is_scene_modified"),
+		"refresh_resource_file": Callable(self, "_refresh_resource_file"),
 	}
 
 	_presence = CollabPresenceService.new()
@@ -101,6 +104,14 @@ func _enter_tree() -> void:
 	_save_service.saved.connect(_on_saved)
 	_save_service.save_failed.connect(_on_save_failed)
 	_save_service.status.connect(_on_save_status)
+
+	_workspace = CollabWorkspaceService.new()
+	_workspace.setup(_coordinator, _settings, _logs, Callable(self, "_project_root"), editor_callables)
+	add_child(_workspace)
+	_workspace.status.connect(_on_workspace_status)
+	_workspace.error_raised.connect(_on_error)
+	_workspace.request_result.connect(_on_workspace_result)
+	_workspace.scene_list_received.connect(_on_scene_list)
 
 	_transfer = CollabTransferManager.new()
 	_transfer.setup(_coordinator, _settings, _logs, Callable(self, "_project_root"))
@@ -143,7 +154,7 @@ func _exit_tree() -> void:
 		remove_control_from_docks(_dock)
 		_dock.queue_free()
 		_dock = null
-	for node in [_presence, _markers, _scene_sync, _save_service, _transfer, _rendezvous, _coordinator, _session_manager]:
+	for node in [_presence, _markers, _scene_sync, _save_service, _workspace, _transfer, _rendezvous, _coordinator, _session_manager]:
 		if node != null and is_instance_valid(node):
 			remove_child(node)
 			node.free()
@@ -151,6 +162,7 @@ func _exit_tree() -> void:
 	_markers = null
 	_scene_sync = null
 	_save_service = null
+	_workspace = null
 	_transfer = null
 	_rendezvous = null
 	_coordinator = null
@@ -198,6 +210,10 @@ func _build_dock() -> void:
 	_dock.snapshot_requested.connect(_on_snapshot_requested)
 	_dock.snapshot_apply_requested.connect(_on_snapshot_apply_requested)
 	_dock.snapshot_discard_requested.connect(_on_snapshot_discard_requested)
+	_dock.new_scene_requested.connect(_on_new_scene_requested)
+	_dock.add_file_requested.connect(_on_add_file_requested)
+	_dock.open_scene_requested.connect(_on_open_scene_requested)
+	_dock.refresh_scenes_requested.connect(_on_refresh_scenes_requested)
 	_dock.username_changed.connect(_on_username_changed)
 	_dock.setup(_settings)
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
@@ -314,6 +330,7 @@ func _on_disconnect_requested() -> void:
 	_coordinator.stop("disconnected by user")
 	_coordinator.registry.clear()
 	_dock.set_participants([])
+	_dock.set_scenes([])
 	_dock.set_invite("")
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
 	_dock.set_connectivity(CollabConstants.ConnectivityState.UNKNOWN, "Not hosting")
@@ -333,6 +350,11 @@ func _on_kick_requested(peer_id: int) -> void:
 
 
 func _on_save_requested() -> void:
+	# Persist remote edits applied to scenes the host is not currently viewing
+	# first, then save the focused scene through the editor's own save API.
+	var persisted: int = _scene_sync.persist_host_scenes()
+	if persisted > 0:
+		_dock.push_message("Persisted remote edits in %d scene(s)." % persisted, false)
 	_save_service.save_now()
 
 
@@ -390,11 +412,17 @@ func _on_session_started(is_host: bool) -> void:
 	_dock.set_mode(_coordinator.workspace_mode)
 	_dock.set_participants(_coordinator.registry.all())
 	_ensure_scene_binding()
+	_last_focus_sent = ""
+	_coordinator.send_scene_focus(_attached_scene_id)
+	if is_host and _workspace.enabled:
+		_workspace.broadcast_scene_list()
+		_dock.set_scenes(_workspace.scan_scenes())
 
 
 func _on_session_stopped(reason: String) -> void:
 	_presence.cursor_state.clear()
 	_dock.set_participants([])
+	_dock.set_scenes([])
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Disconnected: %s" % reason)
 	_dock.set_hosting_controls(false)
 	_dock.set_invite("")
@@ -550,32 +578,121 @@ func _is_scene_modified() -> bool:
 	return _scene_dirty
 
 
+func _refresh_resource_file(res_path: String) -> void:
+	if _editor == null:
+		return
+	var filesystem: EditorFileSystem = _editor.get_resource_filesystem()
+	if filesystem == null:
+		return
+	filesystem.update_file(res_path)
+
+
+# ---------------------------------------------------------------------------
+# Workspace authoring (new scenes / added files)
+# ---------------------------------------------------------------------------
+
+func _on_new_scene_requested(path: String, root_class: String) -> void:
+	var err: String = _workspace.request_new_scene(path, root_class)
+	if not err.is_empty():
+		_dock.push_message(err, true)
+
+
+func _on_add_file_requested(path: String, content: String) -> void:
+	var err: String = _workspace.request_add_file(path, content, true)
+	if not err.is_empty():
+		_dock.push_message(err, true)
+
+
+func _on_open_scene_requested(path: String) -> void:
+	if _editor == null or path.is_empty():
+		return
+	if not ResourceLoader.exists(path):
+		_dock.push_message("Scene '%s' is not available locally yet." % path, true)
+		return
+	_editor.open_scene_from_path(path, false)
+
+
+func _on_refresh_scenes_requested() -> void:
+	if _coordinator.is_host():
+		_workspace.broadcast_scene_list()
+	else:
+		_workspace.request_scene_list()
+
+
+func _on_workspace_status(text: String) -> void:
+	_dock.push_message(text, false)
+
+
+func _on_workspace_result(_request_id: int, ok: bool, path: String, message: String) -> void:
+	if not ok:
+		_dock.push_message("Workspace: %s (%s)" % [message, path], true)
+
+
+func _on_scene_list(scenes: Array, host_revision: int) -> void:
+	_dock.set_scenes(scenes)
+	_dock.push_message("Host lists %d scene(s) (workspace revision %d)." % [scenes.size(), host_revision], false)
+
+
 # ---------------------------------------------------------------------------
 # Scene binding
 # ---------------------------------------------------------------------------
 
+## Binds every open scene root (not just the focused tab) so collaboration is
+## scoped to a scene path rather than to whichever tab the host happens to be
+## looking at. This is what stops a client's work from being undone when the
+## host switches to another scene.
 func _ensure_scene_binding() -> void:
-	var root: Node = _edited_root()
-	# Git presence mode is presence-only: scene operations and transfers stay off.
-	_scene_sync.enabled = _coordinator.workspace_mode == CollabConstants.WorkspaceMode.HOST_WORKSPACE
-	_scene_sync.auto_apply_snapshot = _scene_sync.enabled and _settings.get_bool(CollabSettings.KEY_AUTO_APPLY_SNAPSHOT, true)
-	if root == _attached_root:
-		return
-	_attached_root = root
-	if root == null:
-		_attached_scene_id = ""
-		_scene_sync.detach_scene()
-		_presence.set_local_scene_id("")
-		_markers.set_local_scene_id("")
+	var host_mode: bool = _coordinator.workspace_mode == CollabConstants.WorkspaceMode.HOST_WORKSPACE
+	# Git presence mode is presence-only: scene operations, authoring and
+	# transfers stay off.
+	_scene_sync.enabled = host_mode
+	_scene_sync.auto_apply_snapshot = host_mode and _settings.get_bool(CollabSettings.KEY_AUTO_APPLY_SNAPSHOT, true)
+	_workspace.enabled = host_mode
+
+	var roots: Array = _open_scene_roots()
+	var active_root: Node = _edited_root()
+	var active_path: String = ""
+	var seen: Dictionary = {}
+	for root in roots:
+		if root == null or not is_instance_valid(root):
+			continue
+		var path: String = root.scene_file_path
+		if path.is_empty():
+			continue
+		seen[path] = true
+		var is_active: bool = root == active_root
+		if is_active:
+			active_path = path
+		_scene_sync.bind_scene(root, path, is_active)
+	if roots.is_empty():
+		if not _bound_scene_ids.is_empty():
+			_scene_sync.detach_scene()
+	else:
+		for path in _bound_scene_ids.keys():
+			if not seen.has(path):
+				_scene_sync.unbind_scene(path)
+	_bound_scene_ids = seen
+
+	if active_path != _attached_scene_id:
+		_attached_scene_id = active_path
+		_presence.set_local_scene_id(active_path)
+		_markers.set_local_scene_id(active_path)
 		if _coordinator.is_host():
 			_coordinator.refresh_host_scene_id()
-		return
-	_attached_scene_id = "" if root.scene_file_path.is_empty() else root.scene_file_path
-	_scene_sync.attach_scene(root, _attached_scene_id)
-	_presence.set_local_scene_id(_attached_scene_id)
-	_markers.set_local_scene_id(_attached_scene_id)
-	if _coordinator.is_host():
-		_coordinator.refresh_host_scene_id()
+		if _coordinator.session_manager.is_active() and active_path != _last_focus_sent:
+			_last_focus_sent = active_path
+			_coordinator.send_scene_focus(active_path)
+
+
+func _open_scene_roots() -> Array:
+	if _editor == null:
+		return []
+	var roots: Array = _editor.get_open_scene_roots()
+	if roots.is_empty():
+		var active: Node = _edited_root()
+		if active != null:
+			return [active]
+	return roots
 
 
 func _update_connectivity() -> void:

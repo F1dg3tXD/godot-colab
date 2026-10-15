@@ -58,6 +58,7 @@ func _init() -> void:
 	_test_node_id_map()
 	_test_loopback_session()
 	_test_scene_sync_loopback()
+	_test_multi_scene_isolation()
 	_test_marker_manager()
 	# The marker test needs a live frame so the node's ready/deferred calls run.
 	_run_marker_test_then_finish()
@@ -103,6 +104,37 @@ func _test_protocol() -> void:
 	var bad_cursor: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.CURSOR_UPDATE, {"time_ms": 1})
 	var bad_decoded: Dictionary = CollabProtocol.decode(bad_cursor)
 	_check(not bool(bad_decoded.get("ok", true)), "cursor payload validated")
+
+	# Workspace authoring messages are accepted with a valid shape...
+	var workspace: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+		"request_id": 3,
+		"kind": CollabConstants.WorkspaceOp.ADD_FILE,
+		"path": "scripts/thing.gd",
+		"text": "extends Node\n",
+	})
+	var workspace_decoded: Dictionary = CollabProtocol.decode(workspace)
+	_check(bool(workspace_decoded.get("ok", false)), "workspace request validated")
+	_check(int(workspace_decoded.get("type", -1)) == CollabProtocol.MessageType.WORKSPACE_REQUEST, "workspace request type preserved")
+	# ...and rejected when the text payload is not a string.
+	var bad_workspace: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+		"request_id": 3,
+		"kind": CollabConstants.WorkspaceOp.ADD_FILE,
+		"path": "scripts/thing.gd",
+		"text": 42,
+	})
+	_check(not bool(CollabProtocol.decode(bad_workspace).get("ok", true)), "workspace request rejects non-string text")
+
+	# New message types must be inside the valid type range.
+	var scene_list: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.SCENE_LIST, {"scenes": ["res://a.tscn"], "revision": 4})
+	_check(bool(CollabProtocol.decode(scene_list).get("ok", false)), "scene list validated")
+	var file_apply: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.FILE_APPLY, {
+		"path": "a.tscn", "data": PackedByteArray([1, 2, 3]), "scene": true,
+	})
+	_check(bool(CollabProtocol.decode(file_apply).get("ok", false)), "file apply validated")
+	var bad_file_apply: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.FILE_APPLY, {
+		"path": "a.tscn", "data": "not bytes", "scene": true,
+	})
+	_check(not bool(CollabProtocol.decode(bad_file_apply).get("ok", true)), "file apply rejects non-byte data")
 
 
 func _test_invite_codes() -> void:
@@ -339,6 +371,93 @@ func _pump(host: CollabSessionCoordinator, client: CollabSessionCoordinator, hos
 			return true
 		OS.delay_msec(5)
 	return bool(done.call())
+
+
+## Reproduces the reported bug: the host has scene A open in the background but
+## is focused on scene B. A client editing A must reach A and must not be undone
+## or applied to B.
+func _test_multi_scene_isolation() -> void:
+	print("[multi-scene isolation]")
+	var logs := CollabLog.new()
+	var port: int = 45981
+
+	var host_a := Node3D.new()
+	host_a.name = "RootA"
+	var a_box := Node3D.new()
+	a_box.name = "A_Box"
+	a_box.position = Vector3(1, 1, 1)
+	host_a.add_child(a_box)
+
+	var host_b := Node3D.new()
+	host_b.name = "RootB"
+	var b_box := Node3D.new()
+	b_box.name = "B_Box"
+	b_box.position = Vector3(2, 2, 2)
+	host_b.add_child(b_box)
+
+	var client_a := Node3D.new()
+	client_a.name = "RootA"
+
+	var host_manager := CollabSessionManager.new(logs)
+	var host := CollabSessionCoordinator.new()
+	host.setup(host_manager, logs)
+	var client_manager := CollabSessionManager.new(logs)
+	var client := CollabSessionCoordinator.new()
+	client.setup(client_manager, logs)
+
+	host.get_project_id = func() -> String: return "proj"
+	host.get_scene_id = func() -> String: return "res://b.tscn"
+	host.get_username = func() -> String: return "host"
+	client.get_project_id = func() -> String: return "proj"
+	client.get_scene_id = func() -> String: return "res://a.tscn"
+	client.get_username = func() -> String: return "peer"
+
+	var noop := func() -> void: pass
+	var host_sync := CollabSceneSyncService.new()
+	host_sync.setup(host, logs, {"get_edited_root": func() -> Node: return host_b, "mark_unsaved": noop})
+	var client_sync := CollabSceneSyncService.new()
+	client_sync.setup(client, logs, {"get_edited_root": func() -> Node: return client_a, "mark_unsaved": noop})
+	client_sync.auto_apply_snapshot = true
+
+	# The host has BOTH scenes open; B is the focused tab. The old implementation
+	# bound only the focused tab, so A's context disappeared whenever B got focus.
+	host_sync.bind_scene(host_a, "res://a.tscn", false)
+	host_sync.bind_scene(host_b, "res://b.tscn", true)
+	client_sync.bind_scene(client_a, "res://a.tscn", true)
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "multi-scene host starts (%s)" % error_string(err))
+	err = client.join("127.0.0.1", port, "")
+	_check(err == OK, "multi-scene client join starts (%s)" % error_string(err))
+
+	# The host sends A's snapshot (the client's scene), not the focused B.
+	var synced: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		return client_a.get_node_or_null("A_Box") != null)
+	_check(synced, "client received scene A snapshot while the host was focused on B")
+
+	var client_box: Node3D = client_a.get_node_or_null("A_Box") as Node3D
+	if client_box != null:
+		client_box.position = Vector3(9, 9, 9)
+	var applied: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		var hb: Node3D = host_a.get_node_or_null("A_Box") as Node3D
+		return hb != null and hb.position.is_equal_approx(Vector3(9, 9, 9)))
+	_check(applied, "host applied the client's edit to the background scene A")
+
+	var host_b_box: Node3D = host_b.get_node_or_null("B_Box") as Node3D
+	_check(host_b_box != null and host_b_box.position.is_equal_approx(Vector3(2, 2, 2)), "focused scene B was not modified")
+	_check(host_sync.scene_id == "res://b.tscn", "host still reports its focused scene as B")
+
+	client_sync.detach_scene()
+	host_sync.detach_scene()
+	client.stop("cleanup")
+	host.stop("cleanup")
+	host_a.free()
+	host_b.free()
+	client_a.free()
+	host.free()
+	client.free()
+	host_manager.free()
+	client_manager.free()
 
 
 func _test_scene_sync_loopback() -> void:
