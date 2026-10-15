@@ -3,8 +3,9 @@
 [node name="Node3D" type="Node3D" unique_id=1392377334]
 
 [node name="CSGBox3D" type="CSGBox3D" parent="." unique_id=1525434327]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.8950403, 0.35482407, 0)
+transform = Transform3D(-4.371139e-08, -1, 0, 1, -4.371139e-08, 0, 0, 0, 1, 0, 0.5, 0)
 
 [node name="CSGBox3D2" type="CSGBox3D" parent="CSGBox3D" unique_id=628672571]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.15699458, 0, 0)
-size = Vector3(0.8, 0.8, 0.8)
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0.109326124, 0, 0)
+operation = 2
+size = Vector3(1.0186523, 0.8, 0.8)
