@@ -52,14 +52,15 @@ someone maintaining the add-on, not at end users.
 | `CollabRendezvousClient` | `session/rendezvous_client.gd` | HTTP client for the rendezvous service. |
 | `CollabUpnpForwarder` | `session/upnp_forwarder.gd` | Optional UPnP UDP mapping with cleanup. |
 | `CollabConnectivity` | `session/connectivity.gd` | LAN address discovery + connectivity classification. |
-| `CollabDock` | `ui/collab_dock.gd` | The editor dock UI. Emits signals; contains no protocol logic. |
-| `plugin.gd` | `plugin.gd` | `EditorPlugin` entry point: builds services + dock, forwards 3D input/draw, wires signals. |
+| `CollabDock` | `ui/collab_dock.gd` | The editor dock UI (settings, invitation code, participant list, workspace authoring). Emits signals; contains no protocol logic. |
+| `CollabToolbar` | `ui/collab_toolbar.gd` | Session buttons placed in the editor's top toolbar (`CONTAINER_TOOLBAR`). Pure presentation: emits intent signals, renders state pushed by `plugin.gd`. |
+| `plugin.gd` | `plugin.gd` | `EditorPlugin` entry point: builds services + dock + toolbar, forwards 3D input/draw, intercepts `scene_saved` for shared Ctrl+S, wires signals. |
 
 ## Runtime data flow
 
 ```
-Editor UI (CollabDock)
-        │  signals (host/join/approve/save/download/…)
+Editor UI (CollabDock + CollabToolbar)
+        │  signals (host/join/approve/save/download/…) + editor scene_saved
         ▼
 plugin.gd ──────────────► CollabSessionCoordinator ─────► CollabSessionManager ─► ENetMultiplayerPeer (UDP)
    ▲   ▲                          │  ▲                          │
@@ -92,7 +93,7 @@ Every packet is:
 
 `HEADER_SIZE = 10`. Decoding rejects, in order: too-short packets, bad magic,
 protocol-version mismatch, unknown/zero message type, payloads larger than
-`MAX_PACKET_PAYLOAD` (1 MiB), length mismatches, and non-dictionary payloads.
+`MAX_PACKET_PAYLOAD` (4 MiB), length mismatches, and non-dictionary payloads.
 Each message type additionally has a conservative structural validator (required
 keys, string length caps, array size caps, byte-array type and chunk-size checks).
 See `network/protocol.gd`.
@@ -193,10 +194,34 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
   reparent, `Node3D` transform (position/rotation/scale), and the general
   Inspector-property set described above (encode/decode covers vectors, colors,
   rects, transforms, planes, AABBs, projections, `NodePath`, `StringName`,
-  bounded arrays/packed arrays/dictionaries, and resource references as
-  validated `res://` paths). `encode_value()` refuses values it cannot represent
-  (for example a live `Object` inside a container) instead of writing a lossy
-  value.
+  bounded arrays/packed arrays/dictionaries, and resource references).
+  `encode_value()` refuses values it cannot represent (for example a live
+  `Object` inside a container) instead of writing a lossy value.
+- **Property names.** `is_syncable_property_name()` allows slash sub-properties
+  (`surface_material_override/0`, `theme_override_colors/font_color`) because they
+  are ordinary storable properties, and refuses names starting with `_`, the
+  `metadata/` namespace, and the reserved identity/behaviour names.
+- **Resource references.** A file-backed resource is sent as its validated
+  `res://` path (`VALUE_RESOURCE`). A **path-less/embedded** resource (a material
+  created in the Inspector, a texture dragged from the filesystem) is serialised
+  to text via a temporary `.tres` and sent inline (`VALUE_RESOURCE_INLINE`,
+  capped at `MAX_INLINE_RESOURCE_TEXT = 64 KiB`); the receiver writes a temp
+  `.tres`, loads it, and deletes it. Both directions refuse payloads containing
+  executable/referenced content (`type="script"`, `type="packedscene"`,
+  `script = ExtResource`, …) so an inline resource can never carry code. A peer
+  that cannot resolve a resource emits a conflict instead of clearing the
+  property.
+- **Cheap baseline vs. full value.** The diff watcher's per-scan baseline stores
+  a *comparison-only* projection (`signature_value`): embedded resources are
+  reduced to their instance id, so a scan never serialises every resource. The
+  full wire value is materialised (`encode_value`) only for a property that
+  actually changed. In-place edits to an embedded resource (its reference does
+  not change) are caught by connecting to the resource's `changed` signal.
+- **Cleared object properties.** An object-typed property that is null reports
+  `TYPE_OBJECT` with a null value; `encode_value` maps that to `VALUE_NULL` (not
+  `unsupported`) so the property stays in the collected set. Otherwise a
+  `null → resource` change would be invisible to the diff (the property would be
+  absent from the baseline) and silently never sync.
 - The host validates each operation against the target scene's context and
   revision, applies accepted operations to that scene (live root when open,
   detached model otherwise) using editor-safe mechanisms, bumps that scene's
@@ -205,9 +230,10 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
 - A per-context **diff watcher** (`collaboration/diff_watcher.gd`) periodically
   scans each bound scene for supported changes with debouncing, to catch edits
   made through editor panels that do not emit a reliable general-purpose event.
-  It is bounded to supported property/node types for performance. A context's
-  baseline is refreshed immediately after remote operations are applied, so a
-  remote change is never echoed back as a new local operation.
+  It is bounded to supported property/node types for performance. While remote
+  operations are being applied the watcher is `suspend()`ed and then `resume()`d
+  (which refreshes the baseline), so a remote change is never echoed back as a
+  new local operation.
 
 ### Conflict policy
 
@@ -230,6 +256,15 @@ contexts back to disk (`PackedScene.pack` + `ResourceSaver.save`) after
 not the focused tab. The explicit **Save shared scene** action first calls
 `CollabSceneSyncService.persist_host_scenes()` (all dirty contexts) and then the
 editor's own save for the focused scene via `CollabSaveService`.
+
+**Ctrl+S.** `plugin.gd` connects `EditorPlugin.scene_saved`. On the host a normal
+save is promoted to the same full shared save (`_on_save_requested()`:
+`persist_host_scenes()` then the editor's save). On a client the save is
+forwarded as `SAVE_REQUEST`, and the host answers through
+`CollabSaveService.on_remote_save` (bound to the same host routine). A
+`_suppress_save_signal` flag prevents the add-on's own programmatic save from
+re-triggering the signal. Git presence mode is ignored, so Ctrl+S stays purely
+local there.
 
 ### Resynchronization
 
@@ -260,7 +295,7 @@ project file (`CollabWorkspaceService`):
 
 1. The requester validates the path locally with `CollabPathGuard` and a strict
    extension allow-list (`WRITABLE_EXTENSIONS`) and size cap
-   (`MAX_WORKSPACE_FILE_BYTES = 512 KiB`).
+   (`MAX_WORKSPACE_FILE_BYTES = 2 MiB`).
 2. The host re-validates everything (path traversal / symlink escape, extension,
    size, scene root class against `SCENE_ROOT_CLASSES`, existing-file policy) and
    writes the file **inside the approved project root only**.
@@ -268,9 +303,10 @@ project file (`CollabWorkspaceService`):
    writes its own local copy, and refreshes the editor filesystem
    (`EditorFileSystem.update_file`) and re-advertises `SCENE_LIST`.
 
-Files delivered this way are never executed or imported by the add-on; they
-become ordinary project files the user's editor may scan. Binary/generated
-assets are out of scope for this path and belong to project transfer.
+A request may carry a UTF-8 `text` payload (text files) or a raw `data`
+`PackedByteArray` (a binary asset dropped into the Filesystem dock); both are
+size-checked. Files delivered this way are never executed or imported by the
+add-on; they become ordinary project files the user's editor may scan.
 
 Setting `godot_collab/collaboration/allow_workspace_authoring` (default on)
 gates the whole feature; it is always disabled in Git presence mode.
@@ -288,7 +324,8 @@ that editing a script on any peer reaches the host and the other peers:
    project root (`_walk_files`, bounded by `FILESYNC_MAX_FILES`).
 2. `poll()` scans at most every `FILESYNC_INTERVAL_MS` (1200 ms). A file whose
    stat changed is read (capped at `MAX_WORKSPACE_FILE_BYTES`), sent to the host
-   as a `WORKSPACE_REQUEST` ADD_FILE file op, and its baseline is refreshed.
+   as a `WORKSPACE_REQUEST` ADD_FILE op, and its baseline is refreshed. The
+   payload is exact bytes (`data`) for binary assets or UTF-8 `text` otherwise.
 3. The host validates the path (inside the approved root, not `addons/`, allowed
    extension, size) and rebroadcasts the canonical bytes with `FILE_APPLY`.
 4. Each receiver writes only inside its project root and refreshes its own
@@ -298,10 +335,17 @@ Eligibility (`is_source_file`) excludes generated/vendor trees — `.godot/`,
 `.git/`, and **`addons/`**. Excluding `addons/` is a safety requirement: the
 add-on's own scripts run inside the editor, and live-editing them mid-session
 can crash the local editor and any client that receives the relayed bytes. The
-dock also shows an explicit warning when a session starts. Scene files
-(`.tscn`/`.scn`) are deliberately not handled here; they use the operation
-stream. Files are written to disk only and are never imported or executed by the
-add-on.
+dock also shows an explicit warning when a session starts. Watched extensions
+cover scripts, resources, `project.godot`, and binary assets (images, 3D models,
+audio, fonts). `.import` files are deliberately not watched (import churn).
+
+**Open scenes are protected.** A scene file (`.tscn`/`.scn`/`.escn`) that is
+currently open in the editor is driven by the operation stream, so
+`_is_protected_scene()` makes the file watcher skip relaying it and makes
+receivers skip writing it. A *dropped* scene file that is not open still travels
+as a file. The set of open scene paths is supplied by `plugin.gd` through the
+`open_scene_paths` callable. Files are written to disk only and are never
+imported or executed by the add-on.
 
 ## Presence and remote cursors
 
@@ -353,12 +397,21 @@ delay, download directory, per-file/total transfer limits, join approval,
 invite-token requirement, workspace authoring, and source-file sync. Session
 tokens are never written to committed project files.
 
+Two defaults favour zero-configuration LAN use: the rendezvous URL default is
+empty (`DEFAULT_RENDEZVOUS_URL = ""`, so short codes are unavailable until a
+service is configured and direct `host:port` / LAN invites are used), and
+**host approval is off by default** (`security/approve_joins = false`).
+Approval is an opt-in for untrusted networks; when enabled, the host must confirm
+each participant before workspace access is granted.
+
 ## Lifecycle
 
-`_enter_tree` builds every service, the dock, and enables
-`set_input_event_forwarding_always_enabled()` /
+`_enter_tree` builds every service, the dock, and the toolbar
+(`add_control_to_container(CONTAINER_TOOLBAR, …)`), connects `scene_saved`, and
+enables `set_input_event_forwarding_always_enabled()` /
 `set_force_draw_over_forwarding_enabled()`. `_exit_tree` disconnects signals,
-closes the session, removes the UPnP mapping, frees every node it added, and
-removes the dock. `CollabSessionManager.close()` defers the actual ENet teardown
-if it is called from inside `poll()` (a disconnect signal), avoiding a
-use-after-free of the native peer.
+closes the session, removes the UPnP mapping, removes the toolbar
+(`remove_control_from_container`) and the dock, and frees every node it added.
+`CollabSessionManager.close()` defers the actual ENet teardown if it is called
+from inside `poll()` (a disconnect signal), avoiding a use-after-free of the
+native peer.

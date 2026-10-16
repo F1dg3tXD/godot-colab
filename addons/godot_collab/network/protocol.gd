@@ -211,6 +211,11 @@ static func _validate_payload(type: MessageType, payload: Dictionary) -> String:
 					return "WORKSPACE_REQUEST bad text"
 				if (payload["text"] as String).to_utf8_buffer().size() > CollabConstants.MAX_WORKSPACE_FILE_BYTES:
 					return "WORKSPACE_REQUEST text too large"
+			if payload.has("data"):
+				if typeof(payload["data"]) != TYPE_PACKED_BYTE_ARRAY:
+					return "WORKSPACE_REQUEST bad data"
+				if (payload["data"] as PackedByteArray).size() > CollabConstants.MAX_WORKSPACE_FILE_BYTES:
+					return "WORKSPACE_REQUEST data too large"
 			if payload.has("root_class") and typeof(payload["root_class"]) != TYPE_STRING:
 				return "WORKSPACE_REQUEST bad root_class"
 		MessageType.WORKSPACE_RESULT:

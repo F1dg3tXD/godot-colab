@@ -314,6 +314,7 @@ func _on_ops_to_host(from_peer: int, payload: Dictionary) -> void:
 		return
 	var applied: Array = []
 	var rejected: Array = []
+	ctx.diff_watcher.suspend()
 	for raw in ops:
 		if typeof(raw) != TYPE_DICTIONARY:
 			continue
@@ -332,7 +333,7 @@ func _on_ops_to_host(from_peer: int, payload: Dictionary) -> void:
 			_apply_operation(op, ctx)
 			applied.append(op)
 	ctx.revision += 1
-	ctx.diff_watcher.refresh_baseline()
+	ctx.diff_watcher.resume()
 	ctx.diff_watcher.base_revision = ctx.revision
 	if ctx.scene_id == _primary_scene_id:
 		revision = ctx.revision
@@ -386,12 +387,13 @@ func _on_ops_from_host(payload: Dictionary) -> void:
 		status.emit("Ignored edits for scene '%s' (not open locally)." % op_scene)
 		return
 	_applying = true
+	ctx.diff_watcher.suspend()
 	for raw in ops:
 		if typeof(raw) == TYPE_DICTIONARY:
 			_apply_operation(raw, ctx)
+	ctx.diff_watcher.resume()
 	_applying = false
 	ctx.revision = int(payload.get("revision", ctx.revision))
-	ctx.diff_watcher.refresh_baseline()
 	ctx.diff_watcher.base_revision = ctx.revision
 	if ctx.scene_id == _primary_scene_id:
 		revision = ctx.revision
@@ -464,7 +466,7 @@ func _apply_entry_props(node: Node, props: Variant, ctx: CollabSceneContext) -> 
 		var encoded: Dictionary = (props as Dictionary)[prop]
 		var kind: String = str(encoded.get("kind", ""))
 		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
-		if kind == CollabSceneOperations.VALUE_RESOURCE and value == null:
+		if CollabSceneOperations.is_resource_kind(kind) and value == null:
 			continue
 		_apply_property_editor_safe(node, name, value, ctx)
 
@@ -528,8 +530,8 @@ func _apply_property(op: Dictionary, ctx: CollabSceneContext) -> void:
 		return
 	var kind: String = str(op.get("value_kind", ""))
 	var value: Variant = CollabSceneOperations.decode_value(kind, op.get("value", null))
-	if kind == CollabSceneOperations.VALUE_RESOURCE and value == null:
-		conflict.emit("Resource '%s' for '%s' is missing locally." % [str(op.get("value", "")), property])
+	if CollabSceneOperations.is_resource_kind(kind) and value == null:
+		conflict.emit("Resource for '%s' could not be resolved locally." % property)
 		return
 	_apply_property_editor_safe(node, property, value, ctx)
 
@@ -702,6 +704,7 @@ func _apply_snapshot(snapshot: Dictionary) -> bool:
 	if nodes.is_empty():
 		return false
 	_applying = true
+	ctx.diff_watcher.suspend()
 	ctx.node_ids.clear()
 	_aliases.erase(_alias_key(0, remote_scene))
 	_aliases.erase(_alias_key(_coordinator.local_peer_id(), remote_scene))
@@ -717,7 +720,7 @@ func _apply_snapshot(snapshot: Dictionary) -> bool:
 			_apply_snapshot_node(ctx, nodes[i])
 	_apply_snapshot_props(ctx, root_entry, ctx.root)
 	ctx.revision = int(snapshot.get("revision", ctx.revision))
-	ctx.diff_watcher.refresh_baseline()
+	ctx.diff_watcher.resume()
 	ctx.diff_watcher.base_revision = ctx.revision
 	if ctx.scene_id == _primary_scene_id:
 		revision = ctx.revision
@@ -762,7 +765,7 @@ func _apply_snapshot_props(ctx: CollabSceneContext, entry: Dictionary, node: Nod
 		var encoded: Dictionary = props[prop]
 		var kind: String = str(encoded.get("kind", ""))
 		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
-		if kind == CollabSceneOperations.VALUE_RESOURCE and value == null:
+		if CollabSceneOperations.is_resource_kind(kind) and value == null:
 			continue
 		_apply_property_editor_safe(node, prop, value, ctx)
 

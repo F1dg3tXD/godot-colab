@@ -63,7 +63,7 @@ func register_defaults() -> void:
 	_register(KEY_TRANSFER_DIR, "", TYPE_STRING, "Directory used for downloaded project snapshots.")
 	_register(KEY_MAX_FILE_MB, 64, TYPE_INT, "Maximum size of a single transferred file (MiB).", 1, 4096)
 	_register(KEY_MAX_TOTAL_MB, 512, TYPE_INT, "Maximum total size of a project download (MiB).", 1, 32768)
-	_register(KEY_APPROVE_JOINS, true, TYPE_BOOL, "Require the host to approve each participant before granting workspace access.")
+	_register(KEY_APPROVE_JOINS, false, TYPE_BOOL, "Require the host to approve each participant before granting workspace access. Off by default; enable for untrusted networks.")
 	_register(KEY_REQUIRE_TOKEN, true, TYPE_BOOL, "Require the session token embedded in the invitation code. Disable only for trusted LAN testing.")
 	_register(KEY_ALLOW_WORKSPACE_AUTHORING, true, TYPE_BOOL, "Allow collaborators to create scenes and add files to the host workspace.")
 	_register(KEY_FILE_SYNC, true, TYPE_BOOL, "Relay source-file changes (scripts, shaders, resources, project.godot) to the host. Files under addons/ are never synced.")

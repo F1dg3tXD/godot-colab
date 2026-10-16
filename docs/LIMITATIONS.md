@@ -7,20 +7,26 @@ are listed explicitly so nothing here is mistaken for working functionality.
 ## Verification status
 
 - The headless test suite (`addons/godot_collab/tests/run_tests.gd`) covers the
-  protocol framing/validation (including the workspace message types), invitation
-  codes, path guard, rate limiter, value encode/decode for the general property
-  set, file-sync path predicates + baseline scanning (including `addons/`
-  exclusion), node-id reconciliation, an ENet loopback
-  handshake/cursor/disconnect flow, a two-scene loopback
-  snapshot/host<->peer edit-propagation flow, a **general inspector-property**
-  host<->peer flow, a **rejoin-desync** flow (stale client scene + reconnect), and
-  a **multi-scene isolation** flow (host focused on scene B while a client edits
-  scene A). It passes (see [`TESTING.md`](TESTING.md)).
-- The interactive editor behaviours (dock UI, remote cursor drawing,
-  `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene editing,
-  saving, project download, approval prompts) require **two interactive Godot
-  editor instances** and have a documented manual procedure but are **not**
-  asserted by an automated GUI test.
+  protocol framing/validation (including the workspace message types with text and
+  **byte** payloads), invitation codes, path guard, rate limiter, value
+  encode/decode for the general property set (including **slash sub-property
+  names**, **null object properties**, and an **embedded-resource round-trip**),
+  **inline-resource safety** (script/packed-scene/oversized payloads refused),
+  **settings defaults**, file-sync path predicates + baseline scanning
+  (including `addons/` exclusion and **open-scene protection**), node-id
+  reconciliation, an ENet loopback handshake/cursor/disconnect flow, a two-scene
+  loopback snapshot/host<->peer edit-propagation flow, a **general
+  inspector-property** host<->peer flow (including an **inline
+  `material_override`** host→client), a **rejoin-desync** flow (stale client scene
+  + reconnect), and a **multi-scene isolation** flow (host focused on scene B while
+  a client edits scene A). It passes (see [`TESTING.md`](TESTING.md)).
+- The interactive editor behaviours (dock UI, top-toolbar buttons, remote cursor
+  drawing, `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene
+  editing, **Ctrl+S shared save**, project download, approval prompts) require
+  **two interactive Godot editor instances** and have a documented manual
+  procedure but are **not** asserted by an automated GUI test. In particular the
+  toolbar placement and the `scene_saved` interception are only parse/runtime
+  smoke-tested headless, not visually verified.
 - Testing so far is on **Linux**. Windows and macOS are untested.
 
 ## Networking and connectivity
@@ -51,8 +57,17 @@ are listed explicitly so nothing here is mistaken for working functionality.
     is not a fixed whitelist: bool, int, float, String, `StringName`,
     `Vector2(i)`, `Vector3(i)`, `Color`, `Rect2(i)`, `Transform2D/3D`, `Basis`,
     `Quaternion`, `Plane`, `AABB`, `Projection`, `NodePath`, arrays, packed
-    arrays, dictionaries, and `Resource`/`Object` references (as validated
-    `res://` paths) are supported, within depth/element caps.
+    arrays, dictionaries, and `Resource`/`Object` references, within
+    depth/element caps.
+  - **Slash sub-properties** such as `surface_material_override/0` and
+    `theme_override_colors/font_color` are synced.
+  - **Resource references.** A file-backed resource is sent as its validated
+    `res://` path. A **path-less/embedded** resource (a material created in the
+    Inspector, a texture dragged from the filesystem) is serialized inline (capped
+    at 64 KiB) and rebuilt on the receiver; in-place edits to an embedded resource
+    are detected via its `changed` signal. Inline payloads carrying
+    executable/referenced content (scripts, packed scenes) are refused, and an
+    unresolvable resource produces a conflict rather than clearing the property.
   - Reserved properties are excluded from the generic property path because they
     have dedicated handling: `name`, `owner`, `transform`, `global_transform`,
     and `script`.
@@ -61,8 +76,9 @@ are listed explicitly so nothing here is mistaken for working functionality.
   material sub-editors, and custom inspectors that render to a texture. Editing
   a **source file** on disk is synchronized by the file-sync watcher (see
   below), but a script change does not hot-reload a running editor session.
-- Resource references are carried as validated resource paths or explicitly
-  supported serialized values; not every resource kind is handled.
+- Resource references are carried as validated resource paths or inline-serialized
+  embedded resources; not every resource kind is handled, and an embedded
+  resource larger than 64 KiB cannot be sent inline (use a saved `res://` file).
 - Container values (arrays/dictionaries) are bounded by
   `MAX_CONTAINER_ELEMENTS` (4096) and `MAX_CONTAINER_DEPTH` (6); values holding
   live `Object`s that cannot be represented as a path are refused rather than
@@ -83,7 +99,7 @@ are listed explicitly so nothing here is mistaken for working functionality.
   local scene children with the host's, so unsaved local edits made before
   joining are discarded by design.
 - A snapshot is sent as a single packet and is capped at
-  `CollabConstants.MAX_PACKET_PAYLOAD` (1 MiB). A scene whose serialized
+  `CollabConstants.MAX_PACKET_PAYLOAD` (4 MiB). A scene whose serialized
   snapshot exceeds that cannot be sent and is reported as an error; snapshots
   are not chunked across packets.
 - Node scripts are shared as `res://` paths. The script must exist at the same
@@ -124,12 +140,18 @@ are listed explicitly so nothing here is mistaken for working functionality.
   This is a file write to the host's own scene path, not a transactional save.
 - Auto-save is optional and time-based (after an inactivity period), not a
   robust transactional save.
+- **Ctrl+S** inside a host-workspace session is promoted to a full shared save on
+  the host (persist every scene with remote edits, then save the active scene) and
+  on a client is forwarded as a save request. Git presence mode ignores it, so
+  Ctrl+S stays purely local there. This is only smoke-tested headless, not
+  asserted by an automated GUI test.
 
 ## Workspace authoring (new scenes / added files)
 
-- Only **text** files with an allowed extension
-  (`WRITABLE_EXTENSIONS`) are accepted, up to `MAX_WORKSPACE_FILE_BYTES`
-  (512 KiB). Larger files or binary assets must use project transfer.
+- Only files with an allowed extension (`WRITABLE_EXTENSIONS`) are accepted, up to
+  `MAX_WORKSPACE_FILE_BYTES` (2 MiB). A request may carry UTF-8 text or raw bytes,
+  so a binary asset dropped into the Filesystem dock is included. Larger files
+  must use project transfer.
 - New scenes are limited to the root classes in `SCENE_ROOT_CLASSES`
   (`Node`, `Node2D`, `Node3D`, `Control`, `CanvasLayer`) and are created empty.
 - Transferred files are written to disk but are **never executed or imported** by
@@ -143,11 +165,14 @@ are listed explicitly so nothing here is mistaken for working functionality.
 
 - When enabled (`godot_collab/collaboration/sync_source_files`, default on) the
   host and clients watch eligible **source files** and relay changed file
-  contents to the host, which applies and re-broadcasts them. This covers
-  scripts and text resources (`FILESYNC_EXTENSIONS`) plus `project.godot` and
-  `export_presets.cfg`.
-- Scene files (`.tscn`/`.scn`) are **not** handled here; they go through the
-  structured scene-operation stream.
+  contents to the host, which applies and re-broadcasts them. This covers scripts,
+  resources (`FILESYNC_EXTENSIONS`), binary assets (images, 3D models, audio,
+  fonts), `project.godot` and `export_presets.cfg`. `.import` files are not
+  watched (import churn).
+- Scene files (`.tscn`/`.scn`/`.escn`) that are **open in the editor** are
+  protected: they go through the structured scene-operation stream and the file
+  watcher neither relays nor writes them. A scene file that is dropped but not
+  open travels as an ordinary file.
 - Written to disk only; never imported or executed by the add-on, and only
   inside the approved project root.
 - **Generated/cache data is excluded:** `.godot/`, `.git/`, and, critically,

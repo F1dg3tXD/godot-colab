@@ -23,8 +23,9 @@ const HEADER_SIZE: int = 10
 
 ## Hard upper bound for a single decoded packet payload. Anything larger is
 ## rejected. This keeps a malicious or buggy peer from allocating unbounded
-## memory through var decoding.
-const MAX_PACKET_PAYLOAD: int = 1 << 20 # 1 MiB
+## memory through var decoding. Sized to carry a single workspace file (see
+## [constant MAX_WORKSPACE_FILE_BYTES]) plus protocol overhead.
+const MAX_PACKET_PAYLOAD: int = 4 << 20 # 4 MiB
 
 ## Hard upper bound for a single file-transfer data chunk (project transfer).
 const MAX_TRANSFER_CHUNK: int = 512 * 1024 # 512 KiB
@@ -36,8 +37,11 @@ const DEFAULT_PORT: int = 45899
 const DEFAULT_MAX_PEERS: int = 8
 
 ## Default rendezvous HTTP endpoint. Empty means "no rendezvous configured",
-## in which case only direct (IP:port) connections are offered.
-const DEFAULT_RENDEZVOUS_URL: String = "http://127.0.0.1:9080"
+## in which case only direct (IP:port) connections are offered. Kept empty by
+## default so a fresh install does not depend on any external service; users who
+## want short, shareable invitation codes opt in by setting a URL in Editor
+## Settings (`godot_collab/network/rendezvous_url`).
+const DEFAULT_RENDEZVOUS_URL: String = ""
 
 ## Session invitation codes expire after this many seconds unless refreshed.
 const INVITE_TTL_SECONDS: int = 600
@@ -59,16 +63,33 @@ const MAX_OPS_PER_MESSAGE: int = 256
 
 ## Hard upper bound for a single workspace file/scene payload (create scene or
 ## add file). Larger files must use the project transfer path.
-const MAX_WORKSPACE_FILE_BYTES: int = 512 * 1024 # 512 KiB
+const MAX_WORKSPACE_FILE_BYTES: int = 2 * 1024 * 1024 # 2 MiB
 
 ## Upper bound on the number of scenes advertised in a SCENE_LIST message.
 const MAX_SCENE_LIST: int = 2048
 
 ## File extensions a peer may create or overwrite through the workspace service.
-## Deliberately text-oriented: generated/binary assets use project transfer.
+## Covers source text plus the common binary/text assets a user may drag into the
+## project. Content is written verbatim and never executed; larger assets use the
+## project transfer path instead.
 const WRITABLE_EXTENSIONS: Array[String] = [
-	".tscn", ".tres", ".gd", ".gdshader", ".shader", ".gdshaderinc",
-	".json", ".txt", ".cfg", ".md", ".csv", ".xml", ".import",
+	# Scenes and resources.
+	".tscn", ".scn", ".escn", ".tres", ".res", ".import",
+	# Scripts and shaders.
+	".gd", ".gdshader", ".shader", ".gdshaderinc",
+	# Text/config.
+	".json", ".txt", ".cfg", ".md", ".csv", ".xml", ".po", ".ini", ".toml",
+	# Images.
+	".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tga", ".svg", ".gif",
+	".hdr", ".exr", ".dds", ".ktx",
+	# 3D models.
+	".obj", ".mtl", ".gltf", ".glb", ".fbx", ".dae", ".blend", ".escn",
+	# Audio.
+	".wav", ".ogg", ".mp3", ".oggstr",
+	# Fonts.
+	".ttf", ".otf", ".woff", ".woff2", ".fnt",
+	# Video.
+	".ogv",
 ]
 
 ## Node classes that may be used as the root of a newly created scene.

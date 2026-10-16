@@ -79,9 +79,24 @@ const VALUE_PACKED_VECTOR2: String = "packed_vector2"
 const VALUE_PACKED_VECTOR3: String = "packed_vector3"
 const VALUE_PACKED_COLOR: String = "packed_color"
 const VALUE_RESOURCE: String = "resource_path"
+## An embedded sub-resource (for example a material created on the fly when a
+## texture is dropped onto a mesh) serialised to text. Sent because it has no
+## `res://` path the receiver could load independently.
+const VALUE_RESOURCE_INLINE: String = "resource_inline"
 const VALUE_UNSUPPORTED: String = "unsupported"
 
 const MAX_STRING_VALUE: int = 8192
+## Upper bound for an inline-serialised resource payload. Larger resources must
+## be saved as project files (which sync through the file-sync path) instead.
+const MAX_INLINE_RESOURCE_TEXT: int = 65536
+
+## Substrings that must never appear in an inline-serialised resource. They
+## indicate embedded or referenced executable content (scripts, packed scenes)
+## which the add-on must never distribute or instantiate on a remote peer.
+const UNSAFE_INLINE_MARKERS: Array[String] = [
+	'type="script"', 'type="gdscript"', 'type="csharpscript"', 'type="packedscene"',
+	'script = extresource', 'script=extresource', 'type="script_extension"',
+]
 ## Maximum number of elements accepted in an array/dictionary/packed-array
 ## property. Keeps a malicious peer from forcing large allocations.
 const MAX_CONTAINER_ELEMENTS: int = 4096
@@ -113,10 +128,25 @@ static func is_property_syncable(node: Object, property: String) -> bool:
 	return false
 
 
+## True when [param property] is a name a peer may set. Sub-properties that use a
+## slash (`surface_material_override/0`, `theme_override_colors/font_color`) are
+## allowed because they are ordinary storable properties, but editor-internal
+## metadata, names beginning with `_`, and reserved identity/behaviour
+## properties are refused.
+static func is_syncable_property_name(property: String) -> bool:
+	if property.is_empty() or property.begins_with("_") or property.begins_with("metadata/"):
+		return false
+	if RESERVED_PROPERTIES.has(property):
+		return false
+	return true
+
+
 ## Collects every safe, serialisable property of [param node] as
-## { property: { kind, value } }. Used for both diffing and snapshots so the two
-## paths always agree.
-static func collect_syncable_props(node: Node) -> Dictionary:
+## { property: { kind, value } }. Used for snapshots and for building operations.
+## When [param cheap] is true, embedded resources are reduced to a comparison-only
+## signature instead of being serialised (used by the diff watcher's per-scan
+## baseline so serialising every resource every scan stays off the hot path).
+static func collect_syncable_props(node: Node, cheap: bool = false) -> Dictionary:
 	var out: Dictionary = {}
 	if node == null:
 		return out
@@ -129,16 +159,14 @@ static func collect_syncable_props(node: Node) -> Dictionary:
 			continue
 		if (usage & PROPERTY_USAGE_STORAGE) == 0 and (usage & PROPERTY_USAGE_EDITOR) == 0:
 			continue
-		var encoded: Dictionary = encode_value(node.get(prop))
+		var encoded: Dictionary = signature_value(node.get(prop)) if cheap else encode_value(node.get(prop))
 		if encoded["kind"] != VALUE_UNSUPPORTED:
 			out[prop] = encoded
 	return out
 
 
 static func _is_syncable_name(node: Object, property: String) -> bool:
-	if property.is_empty() or property.begins_with("_") or property.contains("/"):
-		return false
-	if RESERVED_PROPERTIES.has(property):
+	if not is_syncable_property_name(property):
 		return false
 	if node is Node3D and NODE3D_TRANSFORM_PROPERTIES.has(property):
 		return false
@@ -203,10 +231,18 @@ static func encode_value(value: Variant) -> Dictionary:
 			return {"kind": VALUE_NODE_PATH, "value": str(value)}
 		TYPE_OBJECT:
 			var resource := value as Resource
-			if resource != null and not resource.resource_path.is_empty():
-				# Only send the path; the client loads it from its own copy.
+			if resource == null:
+				# A cleared object property reports TYPE_OBJECT with a null value.
+				# Treat it as null so the property stays in the collected set and a
+				# later null -> resource (or resource -> null) change is detected.
+				if value == null:
+					return {"kind": VALUE_NULL, "value": null}
+				return _unsupported()
+			if not resource.resource_path.is_empty():
+				# File-backed resource: send the path, the receiver loads its copy.
 				return {"kind": VALUE_RESOURCE, "value": resource.resource_path}
-			return _unsupported()
+			# Embedded resource: serialise it so the receiver can rebuild it.
+			return _encode_inline_resource(resource)
 		TYPE_ARRAY:
 			if not _is_plain_container(value, 0):
 				return _unsupported()
@@ -237,6 +273,89 @@ static func encode_value(value: Variant) -> Dictionary:
 
 static func is_encodable(value: Variant) -> bool:
 	return encode_value(value)["kind"] != VALUE_UNSUPPORTED
+
+
+## True when [param kind] represents a resource reference that could fail to
+## resolve locally (missing file or refused inline payload).
+static func is_resource_kind(kind: String) -> bool:
+	return kind == VALUE_RESOURCE or kind == VALUE_RESOURCE_INLINE
+
+
+## Comparison-only projection of a value used by the diff watcher's baseline.
+## Identical to [method encode_value] except that an embedded resource is
+## represented by its instance id rather than by its serialised text, so the
+## per-scan comparison never pays the serialisation cost. The full encoding is
+## produced lazily only when a change actually needs to be sent.
+static func signature_value(value: Variant) -> Dictionary:
+	if typeof(value) == TYPE_OBJECT:
+		var resource := value as Resource
+		if resource == null:
+			if value == null:
+				return {"kind": VALUE_NULL, "value": null}
+			return _unsupported()
+		if not resource.resource_path.is_empty():
+			return {"kind": VALUE_RESOURCE, "value": resource.resource_path}
+		return {"kind": VALUE_RESOURCE_INLINE, "value": resource.get_instance_id()}
+	return encode_value(value)
+
+
+## Serialises an embedded resource to Godot text via a temporary `.tres` file.
+## Returns an empty string when the resource cannot be saved, is too large, or
+## contains executable/reference content that must not be distributed.
+static func _encode_inline_resource(resource: Resource) -> Dictionary:
+	var text: String = _resource_to_text(resource)
+	if text.is_empty():
+		return _unsupported()
+	return {"kind": VALUE_RESOURCE_INLINE, "value": text}
+
+
+static func _resource_to_text(resource: Resource) -> String:
+	var path: String = "user://godot_collab_inline_%d.tres" % resource.get_instance_id()
+	var err: Error = ResourceSaver.save(resource, path)
+	if err != OK:
+		return ""
+	var text: String = ""
+	if FileAccess.file_exists(path):
+		text = FileAccess.get_file_as_string(path)
+	var absolute: String = ProjectSettings.globalize_path(path)
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(absolute)
+	if text.is_empty() or text.length() > MAX_INLINE_RESOURCE_TEXT:
+		return ""
+	if _contains_unsafe_inline(text):
+		return ""
+	return text
+
+
+## Rebuilds a resource from inline text by writing it to a temporary `.tres`
+## file and loading it. Content that could carry code is refused.
+static func _load_inline_resource(text: String) -> Resource:
+	if text.is_empty() or text.length() > MAX_INLINE_RESOURCE_TEXT:
+		return null
+	if _contains_unsafe_inline(text):
+		return null
+	var path: String = "user://godot_collab_recv_%d_%d.tres" % [Time.get_ticks_usec(), _receive_counter]
+	_receive_counter += 1
+	var file: FileAccess = FileAccess.open(path, FileAccess.WRITE)
+	if file == null:
+		return null
+	file.store_string(text)
+	file.close()
+	var loaded: Variant = ResourceLoader.load(path)
+	if FileAccess.file_exists(path):
+		DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+	return loaded as Resource
+
+
+static func _contains_unsafe_inline(text: String) -> bool:
+	var lower: String = text.to_lower()
+	for marker in UNSAFE_INLINE_MARKERS:
+		if lower.contains(marker):
+			return true
+	return false
+
+
+static var _receive_counter: int = 0
 
 
 ## Reconstructs a Godot value from a wire representation, or returns
@@ -314,6 +433,9 @@ static func decode_value(kind: String, value: Variant, fallback: Variant = null)
 			if path.is_empty() or not ResourceLoader.exists(path):
 				return fallback
 			return ResourceLoader.load(path)
+		VALUE_RESOURCE_INLINE:
+			var loaded: Resource = _load_inline_resource(str(value))
+			return loaded if loaded != null else fallback
 		_:
 			return fallback
 
@@ -487,10 +609,8 @@ static func validate_op(op: Variant, resolver: Callable) -> String:
 				return "node name too long"
 		OP_PROPERTY:
 			var property: String = str(d.get("property", ""))
-			if property.is_empty() or property.contains("/") or property.begins_with("_"):
+			if not is_syncable_property_name(property):
 				return "invalid property name"
-			if RESERVED_PROPERTIES.has(property):
-				return "reserved property '%s'" % property
 			var kind: String = str(d.get("value_kind", ""))
 			if kind == VALUE_UNSUPPORTED or kind.is_empty():
 				return "unsupported property value"

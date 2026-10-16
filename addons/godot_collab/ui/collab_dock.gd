@@ -30,6 +30,7 @@ const MODE_GIT_PRESENCE: int = 1
 
 var _settings: CollabSettings
 var _built: bool = false
+var _active: bool = false
 var _scroll: ScrollContainer
 var _content: VBoxContainer
 
@@ -41,11 +42,7 @@ var _approve_check: CheckBox
 var _status_label: Label
 var _connectivity_label: Label
 var _mode_label: Label
-var _host_button: Button
-var _join_button: Button
-var _disconnect_button: Button
 var _invite_view: TextEdit
-var _copy_button: Button
 var _invite_input: LineEdit
 var _participant_list: ItemList
 var _request_list: ItemList
@@ -61,7 +58,6 @@ var _transfer_dir_edit: LineEdit
 var _download_button: Button
 var _cancel_button: Button
 var _save_button: Button
-var _snapshot_button: Button
 var _scene_list: ItemList
 var _open_scene_button: Button
 var _refresh_scenes_button: Button
@@ -86,7 +82,7 @@ func setup(settings: CollabSettings) -> void:
 	_username_edit.text = settings.get_string(CollabSettings.KEY_USERNAME, "")
 	_port_spin.value = settings.get_int(CollabSettings.KEY_PORT, CollabConstants.DEFAULT_PORT)
 	_rendezvous_check.button_pressed = settings.get_string(CollabSettings.KEY_RENDEZVOUS_URL, "").is_empty() == false
-	_approve_check.button_pressed = settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, true)
+	_approve_check.button_pressed = settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, false)
 	_transfer_dir_edit.text = settings.get_string(CollabSettings.KEY_TRANSFER_DIR, "")
 
 
@@ -163,21 +159,7 @@ func _build() -> void:
 	_approve_check.text = "Require host approval for new participants"
 	session_box.add_child(_approve_check)
 
-	var host_row := HBoxContainer.new()
-	_host_button = Button.new()
-	_host_button.text = "Host Session"
-	_host_button.pressed.connect(_on_host_pressed)
-	host_row.add_child(_host_button)
-	_join_button = Button.new()
-	_join_button.text = "Join Session"
-	_join_button.pressed.connect(_on_join_pressed)
-	host_row.add_child(_join_button)
-	_disconnect_button = Button.new()
-	_disconnect_button.text = "Disconnect"
-	_disconnect_button.disabled = true
-	_disconnect_button.pressed.connect(func() -> void: disconnect_requested.emit())
-	host_row.add_child(_disconnect_button)
-	session_box.add_child(host_row)
+	session_box.add_child(_hint("Host, Join, Copy Code, Request Snapshot and Disconnect are in the top toolbar."))
 
 	var invite_box := _section("Invitation code")
 	_invite_view = TextEdit.new()
@@ -185,19 +167,11 @@ func _build() -> void:
 	_invite_view.custom_minimum_size = Vector2(0, 54)
 	_invite_view.wrap_mode = TextEdit.LINE_WRAPPING_BOUNDARY
 	invite_box.add_child(_invite_view)
-	_copy_button = Button.new()
-	_copy_button.text = "Copy invitation"
-	_copy_button.pressed.connect(_on_copy_pressed)
-	invite_box.add_child(_copy_button)
 
 	var join_box := _section("Join")
 	_invite_input = LineEdit.new()
-	_invite_input.placeholder_text = "Paste invitation code or host:port"
+	_invite_input.placeholder_text = "Paste invitation code or host:port, then press Join in the toolbar"
 	join_box.add_child(_invite_input)
-	var join_action := Button.new()
-	join_action.text = "Join"
-	join_action.pressed.connect(_on_join_pressed)
-	join_box.add_child(join_action)
 
 	var participants_box := _section("Participants")
 	_participant_list = ItemList.new()
@@ -230,10 +204,6 @@ func _build() -> void:
 	_sync_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	scene_box.add_child(_sync_label)
 	var snapshot_row := HBoxContainer.new()
-	_snapshot_button = Button.new()
-	_snapshot_button.text = "Request snapshot"
-	_snapshot_button.pressed.connect(func() -> void: snapshot_requested.emit())
-	snapshot_row.add_child(_snapshot_button)
 	var apply_button := Button.new()
 	apply_button.text = "Apply pending"
 	apply_button.pressed.connect(func() -> void: snapshot_apply_requested.emit())
@@ -395,6 +365,15 @@ func _section(title_text: String) -> VBoxContainer:
 	return container
 
 
+func _hint(text: String) -> Label:
+	var label := Label.new()
+	label.text = text
+	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.add_theme_color_override("font_color", Color(0.65, 0.65, 0.65))
+	label.add_theme_font_size_override("font_size", 12)
+	return label
+
+
 func _row(label_text: String, control: Control) -> HBoxContainer:
 	var row := HBoxContainer.new()
 	var label := Label.new()
@@ -409,6 +388,21 @@ func _row(label_text: String, control: Control) -> HBoxContainer:
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
+
+## Toolbar entry point: uses the dock's current host settings.
+func request_host() -> void:
+	_on_host_pressed()
+
+
+## Toolbar entry point: uses the invitation code typed into the dock.
+func request_join() -> void:
+	_on_join_pressed()
+
+
+## Toolbar entry point: copies the generated invitation code.
+func request_copy() -> void:
+	_on_copy_pressed()
+
 
 func _on_host_pressed() -> void:
 	var username: String = _username_edit.text.strip_edges()
@@ -513,10 +507,13 @@ func set_connection_status(state: int, text: String) -> void:
 	if _status_label == null:
 		return
 	_status_label.text = "Status: %s" % text
-	_disconnect_button.disabled = state == CollabConstants.ConnectionState.DISCONNECTED
-	var active: bool = state != CollabConstants.ConnectionState.DISCONNECTED
-	_host_button.disabled = active
-	_join_button.disabled = active
+	_active = state != CollabConstants.ConnectionState.DISCONNECTED
+
+
+## True while a session is active (hosting/connecting/connected). The plugin uses
+## this to mirror state onto the toolbar buttons.
+func is_session_active() -> bool:
+	return _active
 
 
 func set_connectivity(state: int, detail: String) -> void:

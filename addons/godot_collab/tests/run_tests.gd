@@ -92,6 +92,49 @@ func _test_property_values() -> void:
 	_check(not n3d_props.has("transform") and not n3d_props.has("position"), "collect excludes handled transform properties")
 	n3d.free()
 
+	# Sub-properties (material overrides, theme overrides) use '/' and are ordinary
+	# storable properties, so they must be syncable; identity/behaviour names must not.
+	_check(CollabSceneOperations.is_syncable_property_name("surface_material_override/0"), "material override sub-property is syncable")
+	_check(CollabSceneOperations.is_syncable_property_name("theme_override_colors/font_color"), "theme override sub-property is syncable")
+	_check(not CollabSceneOperations.is_syncable_property_name("_editor_only"), "underscore-prefixed property rejected")
+	_check(not CollabSceneOperations.is_syncable_property_name("metadata/custom"), "metadata property rejected")
+	_check(not CollabSceneOperations.is_syncable_property_name(""), "empty property name rejected")
+
+	# Embedded (path-less) resources are serialized inline and must survive a
+	# round-trip; the cheap signature only needs to notice they changed.
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.2, 0.4, 0.9)
+	material.roughness = 0.25
+	var encoded_res: Dictionary = CollabSceneOperations.encode_value(material)
+	_check(encoded_res["kind"] == CollabSceneOperations.VALUE_RESOURCE_INLINE, "path-less resource encoded inline")
+	var encoded_text: Variant = encoded_res["value"]
+	_check(typeof(encoded_text) == TYPE_STRING and not (encoded_text as String).is_empty(), "inline payload is non-empty text")
+	var decoded_res: Variant = CollabSceneOperations.decode_value(encoded_res["kind"], encoded_text)
+	_check(decoded_res is StandardMaterial3D, "inline resource decodes back to a resource")
+	if decoded_res is StandardMaterial3D:
+		var restored: StandardMaterial3D = decoded_res
+		_check(restored.albedo_color.is_equal_approx(Color(0.2, 0.4, 0.9)), "inline resource preserves colour")
+		_check(is_equal_approx(restored.roughness, 0.25), "inline resource preserves roughness")
+	# A cleared object property reports TYPE_OBJECT with a null value; it must
+	# encode as null (not unsupported) so a later null -> resource change is
+	# detected by the diff watcher instead of being silently ignored.
+	var empty_mesh := MeshInstance3D.new()
+	var cleared: Variant = empty_mesh.get("material_override")
+	_check(typeof(cleared) == TYPE_OBJECT, "cleared object property is typed as Object")
+	var cleared_encoded: Dictionary = CollabSceneOperations.encode_value(cleared)
+	_check(cleared_encoded["kind"] == CollabSceneOperations.VALUE_NULL, "cleared object property encodes as null")
+	_check(CollabSceneOperations.signature_value(cleared)["kind"] == CollabSceneOperations.VALUE_NULL, "cleared object property signature is null")
+	_check(CollabSceneOperations.collect_syncable_props(empty_mesh).has("material_override"), "collection keeps a null object property")
+	empty_mesh.free()
+
+	_check(CollabSceneOperations.is_resource_kind(CollabSceneOperations.VALUE_RESOURCE_INLINE), "inline kind is a resource kind")
+	_check(CollabSceneOperations.is_resource_kind(CollabSceneOperations.VALUE_RESOURCE), "path resource kind is a resource kind")
+	_check(not CollabSceneOperations.is_resource_kind(CollabSceneOperations.VALUE_VECTOR3), "plain value kind is not a resource kind")
+	var sig: Dictionary = CollabSceneOperations.signature_value(material)
+	_check(sig["kind"] == CollabSceneOperations.VALUE_RESOURCE_INLINE, "signature of embedded resource is inline kind")
+	_check(typeof(sig["value"]) == TYPE_INT, "signature of embedded resource carries its instance id, not serialized text")
+	material = null
+
 
 func _test_filesync_paths() -> void:
 	print("[file sync paths]")
@@ -104,7 +147,12 @@ func _test_filesync_paths() -> void:
 	_check(not CollabWorkspaceService.is_source_file("addons/godot_collab/plugin.gd"), "addon files excluded from sync")
 	_check(not CollabWorkspaceService.is_source_file(".godot/imported/x.gd"), "generated cache excluded")
 	_check(not CollabWorkspaceService.is_source_file(".git/hooks/x.gd"), "git metadata excluded")
-	_check(not CollabWorkspaceService.is_source_file("scenes/main.tscn"), "scene files use the operation stream")
+	# Dropped binary assets are relayed so a client can add art/models/audio.
+	_check(CollabWorkspaceService.is_source_file("art/hero.png"), "png asset watched")
+	_check(CollabWorkspaceService.is_source_file("models/rock.glb"), "glb model watched")
+	_check(CollabWorkspaceService.is_source_file("audio/hit.wav"), "wav audio watched")
+	# A dropped scene travels as a file unless it is open (protected separately).
+	_check(CollabWorkspaceService.is_source_file("scenes/main.tscn"), "tscn tracked for drop-sync")
 	_check(not CollabWorkspaceService.is_source_file("../escape.gd"), "traversal excluded")
 
 	# A real scan must pick up watched files and skip addons/ + caches.
@@ -129,6 +177,13 @@ func _test_filesync_paths() -> void:
 	_check(watched.has("scripts/player.gd"), "baseline tracks a project script")
 	_check(not watched.has("addons/godot_collab/plugin.gd"), "baseline never tracks addon files")
 	_check(not watched.has(".godot/cache.gd"), "baseline never tracks generated caches")
+
+	# A scene open in the editor is driven by the operation stream, so its file
+	# must not also be relayed/written over the raw file path.
+	workspace.open_scene_paths = func() -> Array: return ["res://scenes/main.tscn"]
+	_check(workspace._is_protected_scene("scenes/main.tscn"), "open scene is protected from raw file sync")
+	_check(not workspace._is_protected_scene("scenes/other.tscn"), "closed scene is not protected")
+	_check(not workspace._is_protected_scene("scripts/player.gd"), "non-scene files are never protected")
 
 	workspace.free()
 	coordinator.free()
@@ -200,6 +255,8 @@ func _init() -> void:
 	_test_rate_limiter()
 	_test_node_id_map()
 	_test_property_values()
+	_test_inline_resource_safety()
+	_test_settings_defaults()
 	_test_filesync_paths()
 	_test_id_reconciliation()
 	_test_loopback_session()
@@ -229,6 +286,30 @@ func _finish() -> void:
 			print("  - ", failure)
 		print("RESULT: FAIL")
 		quit(1)
+
+
+func _test_inline_resource_safety() -> void:
+	print("[inline resource safety]")
+	# Inline payloads must never rebuild executable content, whatever a peer
+	# sends, and oversized or empty payloads must be refused rather than loaded.
+	var kind: String = CollabSceneOperations.VALUE_RESOURCE_INLINE
+	_check(CollabSceneOperations.decode_value(kind, "[gd_resource type=\"GDScript\" format=3]") == null, "inline GDScript is refused")
+	_check(CollabSceneOperations.decode_value(kind, "[gd_resource type=\"PackedScene\" format=3]") == null, "inline PackedScene is refused")
+	_check(CollabSceneOperations.decode_value(kind, "[ext_resource type=\"Script\" path=\"res://x.gd\" id=\"1\"]\nscript = ExtResource(\"1\")") == null, "inline payload referencing an ext script is refused")
+	_check(CollabSceneOperations.decode_value(kind, "") == null, "empty inline payload is refused")
+	var oversized: String = "x".repeat(CollabSceneOperations.MAX_INLINE_RESOURCE_TEXT + 1)
+	_check(CollabSceneOperations.decode_value(kind, oversized) == null, "oversized inline payload is refused")
+
+
+func _test_settings_defaults() -> void:
+	print("[settings defaults]")
+	# A fresh install must be usable on a LAN without any service or approval
+	# step; both are opt-in.
+	_check(CollabConstants.DEFAULT_RENDEZVOUS_URL.is_empty(), "rendezvous defaults to empty (LAN/direct connect)")
+	_check(not CollabSettings.new().get_bool(CollabSettings.KEY_APPROVE_JOINS, false), "host approval defaults to off")
+	# A single dropped file is delivered in one workspace packet, so the per-file
+	# cap must not exceed the packet cap.
+	_check(CollabConstants.MAX_WORKSPACE_FILE_BYTES <= CollabConstants.MAX_PACKET_PAYLOAD, "per-file cap fits within one packet")
 
 
 func _test_protocol() -> void:
@@ -271,6 +352,21 @@ func _test_protocol() -> void:
 		"text": 42,
 	})
 	_check(not bool(CollabProtocol.decode(bad_workspace).get("ok", true)), "workspace request rejects non-string text")
+	# A dropped binary file travels as raw bytes alongside (or instead of) text.
+	var workspace_bytes: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+		"request_id": 4,
+		"kind": CollabConstants.WorkspaceOp.ADD_FILE,
+		"path": "art/hero.png",
+		"data": PackedByteArray([0x89, 0x50, 0x4e, 0x47]),
+	})
+	_check(bool(CollabProtocol.decode(workspace_bytes).get("ok", false)), "workspace request accepts byte payload")
+	var bad_workspace_bytes: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+		"request_id": 5,
+		"kind": CollabConstants.WorkspaceOp.ADD_FILE,
+		"path": "art/hero.png",
+		"data": "not bytes",
+	})
+	_check(not bool(CollabProtocol.decode(bad_workspace_bytes).get("ok", true)), "workspace request rejects non-byte data")
 
 	# New message types must be inside the valid type range.
 	var scene_list: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.SCENE_LIST, {"scenes": ["res://a.tscn"], "revision": 4})
@@ -754,6 +850,9 @@ func _test_general_property_sync() -> void:
 	var host_box := Node3D.new()
 	host_box.name = "Box"
 	host_root.add_child(host_box)
+	var host_mesh := MeshInstance3D.new()
+	host_mesh.name = "Mesh"
+	host_root.add_child(host_mesh)
 
 	var client_root := Node3D.new()
 	client_root.name = "Root"
@@ -805,6 +904,20 @@ func _test_general_property_sync() -> void:
 	var client_to_host: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
 		return not host_box.visible)
 	_check(client_to_host, "client inspector property change (visible) reached the host")
+
+	# Dragging a brand-new material from the filesystem (or assigning one in the
+	# inspector) produces a path-less/embedded resource on the host that must
+	# travel inline and be rebuilt on the client.
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.9, 0.1, 0.3)
+	host_mesh.material_override = material
+	var resource_synced: bool = _pump(host, client, host_sync, client_sync, 5000, func() -> bool:
+		var client_mesh: MeshInstance3D = client_root.get_node_or_null("Mesh") as MeshInstance3D
+		if client_mesh == null:
+			return false
+		var received := client_mesh.material_override as StandardMaterial3D
+		return received != null and received.albedo_color.is_equal_approx(Color(0.9, 0.1, 0.3)))
+	_check(resource_synced, "host inline material_override reached the client as a rebuilt resource")
 
 	client_sync.detach_scene()
 	host_sync.detach_scene()

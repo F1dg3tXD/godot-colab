@@ -26,6 +26,11 @@ var _rendezvous: CollabRendezvousClient
 var _upnp: CollabUpnpForwarder
 
 var _dock: CollabDock
+var _toolbar: CollabToolbar
+
+## Guards against reacting to the editor's own `scene_saved` signal when the
+## add-on saves programmatically, which would otherwise recurse.
+var _suppress_save_signal: bool = false
 
 var _attached_scene_id: String = ""
 var _bound_scene_ids: Dictionary = {}
@@ -100,6 +105,7 @@ func _enter_tree() -> void:
 
 	_save_service = CollabSaveService.new()
 	_save_service.setup(_coordinator, _settings, _logs, editor_callables)
+	_save_service.on_remote_save = Callable(self, "_on_save_requested")
 	add_child(_save_service)
 	_save_service.saved.connect(_on_saved)
 	_save_service.save_failed.connect(_on_save_failed)
@@ -107,6 +113,7 @@ func _enter_tree() -> void:
 
 	_workspace = CollabWorkspaceService.new()
 	_workspace.setup(_coordinator, _settings, _logs, Callable(self, "_project_root"), editor_callables)
+	_workspace.open_scene_paths = Callable(self, "_open_scene_paths")
 	add_child(_workspace)
 	_workspace.status.connect(_on_workspace_status)
 	_workspace.error_raised.connect(_on_error)
@@ -133,6 +140,8 @@ func _enter_tree() -> void:
 	_upnp = CollabUpnpForwarder.new()
 
 	_build_dock()
+	_build_toolbar()
+	scene_saved.connect(_on_scene_saved)
 
 	# Receive mouse motion even when no 3D control is dragging, and keep
 	# painting overlays every frame so remote cursors stay smooth.
@@ -150,6 +159,12 @@ func _exit_tree() -> void:
 		_coordinator.stop("plugin disabled")
 	if _upnp != null:
 		_upnp.close()
+	if scene_saved.is_connected(_on_scene_saved):
+		scene_saved.disconnect(_on_scene_saved)
+	if _toolbar != null:
+		remove_control_from_container(EditorPlugin.CONTAINER_TOOLBAR, _toolbar)
+		_toolbar.queue_free()
+		_toolbar = null
 	if _dock != null:
 		remove_control_from_docks(_dock)
 		_dock.queue_free()
@@ -220,6 +235,29 @@ func _build_dock() -> void:
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
 
 
+## Places the session controls in the editor's top toolbar (next to the
+## playtest buttons / Asset Store tab) so they are reachable without opening the
+## dock. The dock keeps the settings and invitation code these buttons operate on.
+func _build_toolbar() -> void:
+	_toolbar = CollabToolbar.new()
+	add_control_to_container(EditorPlugin.CONTAINER_TOOLBAR, _toolbar)
+	_toolbar.host_requested.connect(_dock.request_host)
+	_toolbar.join_requested.connect(_dock.request_join)
+	_toolbar.copy_requested.connect(_dock.request_copy)
+	_toolbar.snapshot_requested.connect(_on_snapshot_requested)
+	_toolbar.disconnect_requested.connect(_on_disconnect_requested)
+	_toolbar.set_session_active(false)
+	_toolbar.set_invite_available(false)
+
+
+## Updates the invitation code in the dock and the toolbar's copy button state.
+func _set_invite(invite: String) -> void:
+	if _dock != null:
+		_dock.set_invite(invite)
+	if _toolbar != null:
+		_toolbar.set_invite_available(not invite.strip_edges().is_empty())
+
+
 func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: bool) -> void:
 	if _coordinator.session_manager.is_active():
 		_dock.push_message("Already in a session. Disconnect first.", true)
@@ -228,7 +266,7 @@ func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: 
 	_coordinator.username = username
 	_coordinator.workspace_mode = mode
 	_coordinator.capabilities = {"scene_ops": true, "cursors": true, "transfer": true, "save": mode == CollabConstants.WorkspaceMode.HOST_WORKSPACE}
-	_coordinator.approve_joins = _settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, true)
+	_coordinator.approve_joins = _settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, false)
 	_coordinator.require_token = _settings.get_bool(CollabSettings.KEY_REQUIRE_TOKEN, true)
 	var max_peers: int = clampi(_settings.get_int(CollabSettings.KEY_MAX_PEERS, CollabConstants.DEFAULT_MAX_PEERS), 1, 64)
 	var err: Error = _coordinator.start_host(port, max_peers, mode, _coordinator.approve_joins)
@@ -255,7 +293,7 @@ func _establish_invite(use_rendezvous: bool, port: int, mode: int) -> void:
 		_short_code = CollabInviteCode.generate_short_code()
 		var host_for_reg: String = advertise if not advertise.is_empty() else _primary_lan_address()
 		_rendezvous.register_code(_short_code, host_for_reg, port, _coordinator.session_token, CollabConstants.INVITE_TTL_SECONDS, _project_id(), mode)
-		_dock.set_invite(_short_code)
+		_set_invite(_short_code)
 		_dock.push_message("Registering invitation code with rendezvous service...", false)
 	else:
 		if use_rendezvous and not _rendezvous.is_configured():
@@ -266,14 +304,14 @@ func _establish_invite(use_rendezvous: bool, port: int, mode: int) -> void:
 func _fallback_to_direct_invite(advertise: String, port: int, mode: int) -> void:
 	var host_ip: String = advertise if not advertise.is_empty() else _primary_lan_address()
 	var invite: String = CollabInviteCode.encode_direct(host_ip, port, _coordinator.session_token, _project_id(), mode)
-	_dock.set_invite(invite)
+	_set_invite(invite)
 
 
 func _on_rendezvous_registered(code: String, ok: bool, error: String) -> void:
 	if _dock == null:
 		return
 	if ok:
-		_dock.set_invite(code)
+		_set_invite(code)
 		_dock.push_message("Invitation code '%s' registered." % code, false)
 	else:
 		_dock.push_message("Rendezvous registration failed (%s). Using a direct invitation code." % error, true)
@@ -332,10 +370,13 @@ func _on_disconnect_requested() -> void:
 	_coordinator.registry.clear()
 	_dock.set_participants([])
 	_dock.set_scenes([])
-	_dock.set_invite("")
+	_set_invite("")
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
 	_dock.set_connectivity(CollabConstants.ConnectivityState.UNKNOWN, "Not hosting")
 	_dock.set_hosting_controls(false)
+	if _toolbar != null:
+		_toolbar.set_session_active(false)
+		_toolbar.set_invite_available(false)
 
 
 func _on_approve_requested(peer_id: int) -> void:
@@ -356,7 +397,30 @@ func _on_save_requested() -> void:
 	var persisted: int = _scene_sync.persist_host_scenes()
 	if persisted > 0:
 		_dock.push_message("Persisted remote edits in %d scene(s)." % persisted, false)
+	_suppress_save_signal = true
 	_save_service.save_now()
+	_suppress_save_signal = false
+
+
+## Fires whenever the editor saves a scene (for example on the user's Ctrl+S).
+## In a live session a host save is promoted to a full shared save (persisting
+## every scene with remote edits) and a client save is forwarded to the host, so a
+## normal Ctrl+S behaves the same for everyone.
+func _on_scene_saved(_filepath: String) -> void:
+	if _suppress_save_signal:
+		return
+	if _coordinator == null or not _coordinator.session_manager.is_active():
+		return
+	if _coordinator.workspace_mode == CollabConstants.WorkspaceMode.GIT_PRESENCE:
+		return
+	if _coordinator.is_host():
+		_on_save_requested()
+	else:
+		# The client's own scene file was just written by the editor; ask the
+		# authoritative host to persist the shared workspace and notify everyone.
+		_suppress_save_signal = true
+		_save_service.save_now()
+		_suppress_save_signal = false
 
 
 func _on_download_requested(root: String) -> void:
@@ -412,6 +476,8 @@ func _on_session_started(is_host: bool) -> void:
 	_dock.set_hosting_controls(true)
 	_dock.set_mode(_coordinator.workspace_mode)
 	_dock.set_participants(_coordinator.registry.all())
+	if _toolbar != null:
+		_toolbar.set_session_active(true)
 	_dock.push_message("Note: editing files under addons/ while a session is live is not supported and can crash clients.", true)
 	_ensure_scene_binding()
 	_last_focus_sent = ""
@@ -438,7 +504,9 @@ func _on_session_stopped(reason: String) -> void:
 	_dock.set_scenes([])
 	_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Disconnected: %s" % reason)
 	_dock.set_hosting_controls(false)
-	_dock.set_invite("")
+	if _toolbar != null:
+		_toolbar.set_session_active(false)
+	_set_invite("")
 	_short_code = ""
 	if _upnp != null:
 		_upnp.close()
@@ -706,6 +774,19 @@ func _open_scene_roots() -> Array:
 		if active != null:
 			return [active]
 	return roots
+
+
+## `res://` paths of every scene currently open, so the workspace service can
+## protect them from raw file relay/overwrite.
+func _open_scene_paths() -> Array:
+	var out: Array = []
+	for root in _open_scene_roots():
+		if root == null or not is_instance_valid(root):
+			continue
+		var path: String = root.scene_file_path
+		if not path.is_empty():
+			out.append(path)
+	return out
 
 
 func _update_connectivity() -> void:

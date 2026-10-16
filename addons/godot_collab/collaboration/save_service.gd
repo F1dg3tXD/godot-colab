@@ -24,6 +24,11 @@ var _auto_save_enabled: bool = false
 var _auto_save_delay: float = 8.0
 var _last_save_status: String = "No save yet."
 
+## Optional plugin hook invoked when a client asks the host to save. It should
+## persist every scene holding remote edits and then save the active scene. When
+## unset the service falls back to saving only the active scene.
+var on_remote_save: Callable = Callable()
+
 
 func setup(coordinator: CollabSessionCoordinator, settings: CollabSettings, logs: CollabLog, editor: Dictionary) -> void:
 	_coordinator = coordinator
@@ -123,7 +128,10 @@ func _scene_is_dirty() -> bool:
 
 func _on_save_message(from_peer: int, type: int, payload: Dictionary) -> void:
 	if type == CollabProtocol.MessageType.SAVE_REQUEST and _coordinator.is_host():
-		_do_save(false)
+		if on_remote_save.is_valid():
+			on_remote_save.call()
+		else:
+			_do_save(false)
 	elif type == CollabProtocol.MessageType.SAVE_RESULT:
 		var ok: bool = bool(payload.get("ok", false))
 		if ok:

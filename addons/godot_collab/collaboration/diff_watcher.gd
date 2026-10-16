@@ -30,6 +30,13 @@ var _root: Node = null
 var _suspended: bool = false
 var _over_budget_warned: bool = false
 var _root_id: int = -1
+## Embedded resources referenced by the current scan, keyed by instance id:
+## { res_id: { resource: Resource, targets: [{node, property}] } }. Rebuilt every
+## scan so a resource's "changed" signal can be used to catch in-place edits
+## (which a reference-only signature would miss).
+var _scan_bindings: Dictionary = {}
+## Live "changed" connections: res_id -> { resource: Resource, callable: Callable }.
+var _res_conns: Dictionary = {}
 
 
 func setup(node_ids: CollabNodeIdMap) -> void:
@@ -37,6 +44,7 @@ func setup(node_ids: CollabNodeIdMap) -> void:
 
 
 func set_root(root: Node) -> void:
+	_clear_resource_tracking()
 	_root = root
 	_baseline.clear()
 	_over_budget_warned = false
@@ -47,6 +55,9 @@ func set_root(root: Node) -> void:
 ## Re-reads the current tree without emitting anything. Call immediately after
 ## applying remote operations.
 func refresh_baseline() -> void:
+	# Drop stale resource bindings/connections; the next scan rebuilds them
+	# against the post-apply tree so an echoed apply can never ping-pong.
+	_clear_resource_tracking()
 	if _root == null or not is_instance_valid(_root):
 		return
 	_baseline.clear()
@@ -84,11 +95,13 @@ func _scan() -> void:
 		_baseline.clear()
 		_capture_baseline(_root)
 		return
+	_scan_bindings = {}
 	var ops: Array = []
 	var next_baseline: Dictionary = {}
 	for iid in current.keys():
 		var node: Node = current[iid]
 		var entry: Dictionary = _describe(node)
+		_record_bindings(node, entry)
 		if _baseline.has(iid):
 			_compare(_baseline[iid], entry, ops)
 		else:
@@ -103,6 +116,7 @@ func _scan() -> void:
 			if node_id != 0:
 				ops.append(CollabSceneOperations.make_remove_op(local_peer_id, _next_op_id(), scene_id, base_revision, node_id))
 	_baseline = next_baseline
+	_sync_resource_connections()
 	if not ops.is_empty():
 		operations_detected.emit(ops)
 
@@ -168,7 +182,9 @@ func _new_node_op(node: Node, entry: Dictionary) -> Dictionary:
 		parent_id, node.get_class(), node.name, node_id if not is_host else -1)
 	op["node_id"] = node_id
 	op["script"] = _script_path(node)
-	op["props"] = entry["props"]
+	# A create carries the full property set (inline resources included), not the
+	# cheap comparison signatures the baseline uses.
+	op["props"] = CollabSceneOperations.collect_syncable_props(node)
 	if entry["is_node3d"]:
 		var t: Transform3D = entry["transform"]
 		op["position"] = t.origin
@@ -205,24 +221,99 @@ func _compare(old: Dictionary, new_entry: Dictionary, ops: Array) -> void:
 	for prop in new_props.keys():
 		if not old_props.has(prop):
 			continue
-		if old_props[prop] != new_props[prop]:
-			ops.append({
-				"op_id": _next_op_id(),
-				"source_peer": local_peer_id,
-				"scene_id": scene_id,
-				"base_revision": base_revision,
-				"type": CollabSceneOperations.OP_PROPERTY,
-				"node_id": node_id,
-				"property": prop,
-				"value_kind": new_props[prop]["kind"],
-				"value": new_props[prop]["value"],
-			})
+		if old_props[prop] == new_props[prop]:
+			continue
+		var node: Node = _node_ids.node_for(node_id)
+		if node == null:
+			continue
+		# The baseline stores cheap signatures, so the full wire value is
+		# produced here, once, only for properties that actually changed.
+		var encoded: Dictionary = CollabSceneOperations.encode_value(node.get(prop))
+		if encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
+			continue
+		ops.append(CollabSceneOperations.make_property_op(
+			local_peer_id, _next_op_id(), scene_id, base_revision, node_id, prop, encoded))
 
 
-## Collects every safe, serialisable property of [param node]. The policy lives
-## in [CollabSceneOperations] so diffing and snapshots always agree.
+## Collects a comparison-only projection of [param node]'s properties. The
+## policy lives in [CollabSceneOperations]; `cheap = true` reduces embedded
+## resources to an instance-id token so the per-scan baseline stays inexpensive.
 func _watched_props(node: Node) -> Dictionary:
-	return CollabSceneOperations.collect_syncable_props(node)
+	return CollabSceneOperations.collect_syncable_props(node, true)
+
+
+## Records embedded resources referenced by [param entry] so their "changed"
+## signal can trigger a targeted property operation for in-place edits.
+func _record_bindings(node: Node, entry: Dictionary) -> void:
+	var props: Dictionary = entry.get("props", {})
+	for prop in props.keys():
+		var encoded: Dictionary = props[prop]
+		if str(encoded.get("kind", "")) != CollabSceneOperations.VALUE_RESOURCE_INLINE:
+			continue
+		var res_id: int = int(encoded.get("value", 0))
+		if res_id == 0:
+			continue
+		var resource: Resource = node.get(prop) as Resource
+		if resource == null:
+			continue
+		if not _scan_bindings.has(res_id):
+			_scan_bindings[res_id] = {"resource": resource, "targets": []}
+		(_scan_bindings[res_id]["targets"] as Array).append({"node": node, "property": str(prop)})
+
+
+func _sync_resource_connections() -> void:
+	for res_id in _res_conns.keys():
+		if _scan_bindings.has(res_id):
+			continue
+		var tracked: Dictionary = _res_conns[res_id]
+		var resource: Resource = tracked.get("resource")
+		var callback: Callable = tracked.get("callable")
+		if resource != null and callback.is_valid() and resource.changed.is_connected(callback):
+			resource.changed.disconnect(callback)
+		_res_conns.erase(res_id)
+	for res_id in _scan_bindings.keys():
+		if _res_conns.has(res_id):
+			continue
+		var resource: Resource = _scan_bindings[res_id].get("resource")
+		if resource == null:
+			continue
+		var callback: Callable = _on_resource_changed.bind(res_id)
+		resource.changed.connect(callback)
+		_res_conns[res_id] = {"resource": resource, "callable": callback}
+
+
+## Emits property operations for an embedded resource edited in place. The
+## reference-based signature does not change for these, so the resource's
+## "changed" signal is the only reliable trigger.
+func _on_resource_changed(res_id: int) -> void:
+	if not enabled or _suspended:
+		return
+	var binding: Variant = _scan_bindings.get(res_id)
+	if binding == null:
+		return
+	var ops: Array = []
+	for target in (binding["targets"] as Array):
+		var node: Node = target.get("node")
+		if not is_instance_valid(node):
+			continue
+		var prop: String = str(target.get("property", ""))
+		var encoded: Dictionary = CollabSceneOperations.encode_value(node.get(prop))
+		if encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
+			continue
+		ops.append(CollabSceneOperations.make_property_op(local_peer_id, _next_op_id(), scene_id, base_revision, _ensure_id(node), prop, encoded))
+	if not ops.is_empty():
+		operations_detected.emit(ops)
+
+
+func _clear_resource_tracking() -> void:
+	for res_id in _res_conns.keys():
+		var tracked: Dictionary = _res_conns[res_id]
+		var resource: Resource = tracked.get("resource")
+		var callback: Callable = tracked.get("callable")
+		if resource != null and callback.is_valid() and resource.changed.is_connected(callback):
+			resource.changed.disconnect(callback)
+	_res_conns.clear()
+	_scan_bindings.clear()
 
 
 func _transform_delta(a: Transform3D, b: Transform3D) -> float:

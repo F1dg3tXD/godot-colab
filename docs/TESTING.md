@@ -13,17 +13,23 @@ cd /path/to/godot-colab
 - Exit code `0` and a final `RESULT: PASS` mean all checks passed.
 - Exit code `1` with `RESULT: FAIL` means at least one check failed; each failure
   is printed individually.
-- The suite covers: protocol framing/validation (bad magic, truncated packets,
-  oversized payloads, non-dictionary payloads, and the workspace message types
-  `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/`SCENE_LIST`), invitation
-  code encode/decode, path guard (traversal/absolute/symlink), rate limiter,
-  node-id allocation (positive authoritative ids, `-1` sentinel avoidance, no id
-  reuse after `clear()`), general property value encode/decode (vectors, rects,
+- The suite (currently **190 checks**) covers: protocol framing/validation (bad
+  magic, truncated packets, oversized payloads, non-dictionary payloads, and the
+  workspace message types `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/
+  `SCENE_LIST`, including text **and** byte payloads), invitation code
+  encode/decode, path guard (traversal/absolute/symlink), rate limiter, node-id
+  allocation (positive authoritative ids, `-1` sentinel avoidance, no id reuse
+  after `clear()`), general property value encode/decode (vectors, rects,
   transforms, AABBs, `StringName`, arrays, dictionaries; refusal of containers
-  holding live `Object`s), `is_property_syncable`/`collect_syncable_props`
-  behaviour (general properties accepted, `name`/`script`/`transform` reserved),
-  source-file path predicates and baseline scanning (`addons/`, `.godot/`,
-  `.git/` excluded; scenes not treated as source files), node-id reconciliation
+  holding live `Object`s; **null object properties** encode as `null`; an
+  **embedded-resource round-trip**), **inline-resource safety** (GDScript/
+  PackedScene/oversized/empty inline payloads refused), **settings defaults**
+  (empty rendezvous default, approval off by default, per-file cap ≤ packet cap),
+  `is_syncable_property_name` (slash sub-properties allowed;
+  `_`/`metadata/`/reserved refused) and `collect_syncable_props` behaviour
+  (general properties accepted, `name`/`script`/`transform` reserved), source-file
+  path predicates and baseline scanning (`addons/`, `.godot/`, `.git/` excluded;
+  **binary assets included**; **open scenes protected**), node-id reconciliation
   against a host snapshot, marker scene instantiation with username/colour
   application and no-op default colour, a `CollabMarkerManager` check (marker
   created for a remote cursor, parented into the viewport container, removed when
@@ -32,12 +38,12 @@ cd /path/to/godot-colab
   two-scene loopback test where a host scene is snapshotted to a joining peer and
   host/peer create/remove/transform edits propagate both ways without id
   collisions or duplicated nodes, a **general inspector-property** loopback test
-  (`editor_description`/`process_priority` host→client, `visible` client→host),
-  a **rejoin-desync** test (a client with a stale local scene joins, is
-  snapshotted, and its later edits target the correct node; then it reconnects
-  with a fresh client and is re-keyed to host ids), and a **multi-scene
-  isolation** test where the host is focused on scene B while a client edits
-  scene A (the edit must reach A, not B).
+  (`editor_description`/`process_priority` host→client, `visible` client→host,
+  plus an **inline `material_override`** host→client), a **rejoin-desync** test (a
+  client with a stale local scene joins, is snapshotted, and its later edits
+  target the correct node; then it reconnects with a fresh client and is re-keyed
+  to host ids), and a **multi-scene isolation** test where the host is focused on
+  scene B while a client edits scene A (the edit must reach A, not B).
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -63,10 +69,10 @@ curl http://127.0.0.1:9080/health
 ### Automated coverage vs. GUI coverage
 
 Automated tests do **not** drive the editor GUI. The following behaviours are
-only verified by the manual procedure below: dock interactions, remote cursor
-drawing in the viewport, editor-safe scene application, saving, project
-download, and approval prompts. Do not report these as passing based on the
-headless suite.
+only verified by the manual procedure below: dock and **top-toolbar**
+interactions, remote cursor drawing in the viewport, editor-safe scene
+application, saving (including **Ctrl+S shared save**), project download, and
+approval prompts. Do not report these as passing based on the headless suite.
 
 ## Manual integration test (two editor instances)
 
@@ -87,9 +93,14 @@ instances, enable **Godot Collab** in each, and run through the checks:
 
 1. **Enable/disable/reload.** Enable the plugin, then disable and re-enable it.
    No errors in the editor's Output panel; the dock disappears and reappears.
-2. **Host + client connect (loopback/LAN).** In Alice: set a username, click
-   **Host Session**, copy the invitation code. In Bob: paste the code, click
-   **Join Session**. Alice approves the prompt. Both docks show *Connected*.
+2. **Top toolbar + host/client connect (loopback/LAN).** Confirm the top toolbar
+   shows **Host / Join / Copy Code / Request Snapshot / Disconnect** next to the
+   playtest buttons, and that Host/Join are disabled while a session is active and
+   Disconnect is disabled while disconnected. In Alice: set a username, click
+   **Host** in the toolbar, then **Copy Code**. In Bob: paste the code into the
+   dock's session-code field, click **Join** in the toolbar. Both docks show
+   *Connected*. (With the default approval-off, no prompt appears; enable *Require
+   host approval* in the dock to test the approval prompt path.)
 3. **Usernames + participant list.** Both docks list two participants with the
    correct names and host/client roles.
 4. **Remote cursors.** Move the mouse over Alice's 3D viewport: Bob sees a
@@ -112,6 +123,12 @@ instances, enable **Godot Collab** in each, and run through the checks:
    conflict/reject notice, not a silent drop.
 9. **Save persists.** On the host, click **Save Shared Scene**. Restart the
    editor and reopen the scene; verify the accepted changes are present.
+9c. **Ctrl+S shared save.** With the session running, have the client move a node
+    in a scene the host is *not* focused on, then press Ctrl+S in the client. The
+    client should not error; on the host, focus that scene and confirm the move is
+    present, and that the host's on-disk copy contains it after the host's own
+    Ctrl+S or a moment of inactivity. Press Ctrl+S on the host with a client
+    connected and confirm no rebroadcast loop appears in the Output panel.
 9a. **Multi-scene: host on a different tab.** With a session running, open two
     scenes in the host editor (A and B) and focus B. In the client, edit scene A
     (move a node). Verify the change appears in A on the host and that B is
@@ -131,6 +148,16 @@ instances, enable **Godot Collab** in each, and run through the checks:
     it. Confirm that editing anything under `addons/` is **not** relayed, and
     that the dock shows the "do not edit addons while a session is live"
     warning.
+8d. **Resources + binary asset sync.** On one peer, assign a new material (create
+    a `StandardMaterial3D` in the Inspector, or drag a texture from the
+    Filesystem dock onto a `MeshInstance3D`'s `Material Override`) and confirm it
+    appears on the other peer. Edit that material's colour in place and confirm
+    the change propagates. Set `surface_material_override/0` and confirm it
+    propagates. Separately, drop a binary image/model/audio file into the
+    Filesystem dock and confirm both peers get a local copy.
+8e. **Open-scene protection.** Open `res://scenes/test.tscn` on the host and have
+    the client save a change to that same scene file path: confirm the operation
+    stream carries the change and the raw file watcher does not double-write it.
 8c. **Rejoin after a crash.** With the session running, close the client editor
     (kill it). Reopen the client project and join again. Toggle a node's
     visibility / move a node from the client and confirm it affects the

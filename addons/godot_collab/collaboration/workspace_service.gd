@@ -34,13 +34,25 @@ const EXCLUDED_PREFIXES: Array[String] = [".godot/", ".git/", "addons/"]
 ## Prefixes excluded from the source-file watcher only (never from scene lists).
 const FILESYNC_EXCLUDED_PREFIXES: Array[String] = [".godot/", ".git/", "addons/", ".vscode/", ".idea/", ".import/", "android/"]
 
-## Text/source extensions relayed by the file watcher. Scene files (.tscn) are
-## excluded on purpose: live scenes are synchronised as structured operations,
-## so shipping the whole file would fight with the operation stream.
+## Extensions relayed by the file watcher: source text plus binary assets a user
+## may drag into the project (images, models, audio, fonts, video). `.tscn`/`.scn`
+## are included so a dropped scene also travels, but a scene that is currently
+## open in the editor is protected: it is synchronised as structured operations
+## instead, and its file is never overwritten underneath the editor.
 const FILESYNC_EXTENSIONS: Array[String] = [
 	".gd", ".gdshader", ".shader", ".gdshaderinc", ".tres", ".res",
-	".json", ".cfg", ".txt", ".csv", ".xml", ".md", ".po", ".svg",
+	".json", ".cfg", ".txt", ".csv", ".xml", ".md", ".po", ".svg", ".ini", ".toml",
+	".tscn", ".scn", ".escn",
+	".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tga", ".gif", ".hdr", ".exr", ".dds", ".ktx",
+	".obj", ".mtl", ".gltf", ".glb", ".fbx", ".dae", ".blend",
+	".wav", ".ogg", ".mp3", ".oggstr",
+	".ttf", ".otf", ".woff", ".woff2", ".fnt",
+	".ogv",
 ]
+
+## Scene-file extensions. A file with one of these extensions that is currently
+## open in the editor is never relayed or overwritten as a raw file.
+const SCENE_EXTENSIONS: Array[String] = [".tscn", ".scn", ".escn"]
 
 ## Exact file names (with no useful extension) that are still watched.
 const FILESYNC_FILES: Array[String] = ["project.godot", "export_presets.cfg"]
@@ -60,6 +72,10 @@ var _settings: CollabSettings
 var _logs: CollabLog
 var _project_root: Callable = Callable()
 var _editor: Dictionary = {}
+## Supplied by the plugin: returns the `res://` paths of scenes currently open in
+## the editor. Those files are protected from raw file relay/overwrite because
+## they are synchronised as structured operations.
+var open_scene_paths: Callable = Callable()
 var _host_revision: int = 0
 var _request_counter: int = 0
 var _watch_baseline: Dictionary = {} # rel -> {size:int, mtime:int, sha:String}
@@ -210,8 +226,12 @@ func _host_handle_request(from_peer: int, payload: Dictionary) -> void:
 		CollabConstants.WorkspaceOp.CREATE_SCENE:
 			_host_create_scene(request_id, path, str(payload.get("root_class", "")), from_peer)
 		CollabConstants.WorkspaceOp.ADD_FILE:
-			var text: String = str(payload.get("text", ""))
-			var bytes: PackedByteArray = text.to_utf8_buffer()
+			var bytes: PackedByteArray
+			var raw_data: Variant = payload.get("data")
+			if typeof(raw_data) == TYPE_PACKED_BYTE_ARRAY:
+				bytes = raw_data
+			else:
+				bytes = str(payload.get("text", "")).to_utf8_buffer()
 			_host_add_file(request_id, path, bytes, bool(payload.get("overwrite", true)), from_peer)
 		CollabConstants.WorkspaceOp.LIST_SCENES:
 			_send_scene_list_to(from_peer)
@@ -301,6 +321,10 @@ func _apply_incoming_file(payload: Dictionary) -> void:
 	var rel: String = CollabPathGuard.normalize_relative(str(payload.get("path", "")))
 	if rel.is_empty() or not _is_writable_path(rel):
 		error_raised.emit("Refused unsafe file from host: %s" % str(payload.get("path", "")))
+		return
+	if _is_protected_scene(rel):
+		# Never overwrite an open scene's file underneath the editor; the
+		# operation stream is already keeping its in-memory state in sync.
 		return
 	var data: Variant = payload.get("data", PackedByteArray())
 	if typeof(data) != TYPE_PACKED_BYTE_ARRAY:
@@ -442,6 +466,9 @@ func _scan_and_sync() -> void:
 func _relay_local_change(rel: String, root: String) -> void:
 	if not _is_filesync_path(rel):
 		return
+	if _is_protected_scene(rel):
+		# Open scenes travel as structured operations; never ship the raw file.
+		return
 	if not _can_request():
 		return
 	var absolute: String = CollabPathGuard.resolve_within(root, rel)
@@ -456,13 +483,14 @@ func _relay_local_change(rel: String, root: String) -> void:
 	if _coordinator.is_host():
 		_host_add_file(_next_request_id(), rel, bytes, true, _coordinator.local_peer_id())
 	else:
-		var text: String = bytes.get_string_from_utf8()
+		# Send the exact bytes so binary assets (images, models, audio) survive;
+		# a UTF-8 round trip would corrupt them.
 		_coordinator.send_workspace(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
 			"request_id": _next_request_id(),
 			"kind": CollabConstants.WorkspaceOp.ADD_FILE,
 			"path": rel,
 			"overwrite": true,
-			"text": text,
+			"data": bytes,
 		})
 		status.emit("Synced '%s' to the host." % rel)
 
@@ -500,6 +528,19 @@ func _filesync_dir_excluded(rel: String) -> bool:
 
 func _is_filesync_path(rel: String) -> bool:
 	return is_source_file(rel)
+
+
+## True when [param rel] is a scene file that is currently open in the editor and
+## must therefore be handled by the operation stream rather than as a raw file.
+func _is_protected_scene(rel: String) -> bool:
+	if not open_scene_paths.is_valid():
+		return false
+	var ext: String = "." + rel.get_extension().to_lower()
+	if not SCENE_EXTENSIONS.has(ext):
+		return false
+	var res_path: String = rel if rel.begins_with("res://") else "res://" + rel
+	var paths: Array = open_scene_paths.call()
+	return paths.has(res_path)
 
 
 ## True when [param rel] is a project source file the watcher may relay. Excludes
