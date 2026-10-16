@@ -10,12 +10,15 @@ extends HBoxContainer
 
 signal host_requested()
 signal join_requested()
+## Paste an invitation code from the clipboard and join in one action.
+signal paste_join_requested()
 signal copy_requested()
 signal snapshot_requested()
 signal disconnect_requested()
 
 var _host_button: Button
 var _join_button: Button
+var _paste_join_button: Button
 var _copy_button: Button
 var _snapshot_button: Button
 var _disconnect_button: Button
@@ -30,6 +33,7 @@ func _init() -> void:
 
 	_host_button = _make_button("Host", "Start hosting a collaborative session using the dock's settings.", func() -> void: host_requested.emit())
 	_join_button = _make_button("Join", "Join a session using the invitation code entered in the dock.", func() -> void: join_requested.emit())
+	_paste_join_button = _make_button("Paste & Join", "Paste an invitation code from the clipboard and join the session.", func() -> void: paste_join_requested.emit())
 	add_child(VSeparator.new())
 	_copy_button = _make_button("Copy Code", "Copy the current invitation code to the clipboard.", func() -> void: copy_requested.emit())
 	_snapshot_button = _make_button("Request Snapshot", "Ask the host for a fresh authoritative snapshot of the current scene.", func() -> void: snapshot_requested.emit())
@@ -64,6 +68,7 @@ func _refresh() -> void:
 		return
 	_host_button.disabled = _session_active
 	_join_button.disabled = _session_active
+	_paste_join_button.disabled = _session_active
 	_disconnect_button.disabled = not _session_active
 	_snapshot_button.disabled = not _session_active
 	_copy_button.disabled = not _invite_available

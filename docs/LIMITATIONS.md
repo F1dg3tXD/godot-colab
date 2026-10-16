@@ -14,11 +14,14 @@ are listed explicitly so nothing here is mistaken for working functionality.
   **inline-resource safety** (script/packed-scene/oversized payloads refused),
   **settings defaults**, file-sync path predicates + baseline scanning
   (including `addons/` exclusion and **open-scene protection**), node-id
-  reconciliation, an ENet loopback handshake/cursor/disconnect flow, a two-scene
-  loopback snapshot/host<->peer edit-propagation flow, a **general
-  inspector-property** host<->peer flow (including an **inline
-  `material_override`** host→client), a **rejoin-desync** flow (stale client scene
-  + reconnect), and a **multi-scene isolation** flow (host focused on scene B while
+  reconciliation, **pending-resource queueing/resolution**, an ENet loopback
+  handshake/cursor/disconnect flow, a two-scene loopback
+  snapshot/host<->peer edit-propagation flow, a **general inspector-property**
+  host<->peer flow (including an **inline `material_override`** host→client, an
+  **in-place edit of that embedded material**, and an **in-place edit of a nested
+  `BoxShape3D` sub-resource** on a `CollisionShape3D`), a **workspace
+  rename/delete** loopback flow, a **rejoin-desync** flow (stale client scene +
+  reconnect), and a **multi-scene isolation** flow (host focused on scene B while
   a client edits scene A). It passes (see [`TESTING.md`](TESTING.md)).
 - The interactive editor behaviours (dock UI, top-toolbar buttons, remote cursor
   drawing, `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene
@@ -64,10 +67,17 @@ are listed explicitly so nothing here is mistaken for working functionality.
   - **Resource references.** A file-backed resource is sent as its validated
     `res://` path. A **path-less/embedded** resource (a material created in the
     Inspector, a texture dragged from the filesystem) is serialized inline (capped
-    at 64 KiB) and rebuilt on the receiver; in-place edits to an embedded resource
-    are detected via its `changed` signal. Inline payloads carrying
+    at 64 KiB) and rebuilt on the receiver. Inline payloads carrying
     executable/referenced content (scripts, packed scenes) are refused, and an
-    unresolvable resource produces a conflict rather than clearing the property.
+    unresolvable **path-backed** resource is queued and retried (up to 20 s)
+    rather than clearing the property.
+  - **In-place / nested resource edits** (a material's colour, a `BoxShape3D`'s
+    size, an `Environment`'s mode, including sub-resources owned by a node) are
+    detected by re-serializing embedded resources on a slower cadence (1.5 s),
+    because most resource types do **not** emit `changed` for ordinary property
+    edits. A consequence: an embedded-resource edit can take up to ~1.5 s to
+    appear on the other peer, and two edits to the same embedded resource that
+    both complete within one 1.5 s window may collapse into the final value.
   - Reserved properties are excluded from the generic property path because they
     have dedicated handling: `name`, `owner`, `transform`, `global_transform`,
     and `script`.
@@ -156,6 +166,15 @@ are listed explicitly so nothing here is mistaken for working functionality.
   (`Node`, `Node2D`, `Node3D`, `Control`, `CanvasLayer`) and are created empty.
 - Transferred files are written to disk but are **never executed or imported** by
   the add-on; the editor may scan them like any project file.
+- **File rename/delete** is propagated as add-then-delete (there is no dedicated
+  rename op). A renamed file is delivered to its new path and the old path is
+  removed, so peers converge rather than accumulating duplicates. Because the
+  removal is host-authoritative, a file deleted on a client is deleted on the
+  host and every peer.
+- `.import` sidecars are deliberately **not** synced (an import-churn loop
+  between editors was observed). A renamed imported asset (image/model/audio) may
+  therefore re-import with a fresh UID on a peer; path-based references still
+  resolve, but UID-based references to the renamed asset may not.
 - The scene list is a directory scan of `res://` and is capped at
   `MAX_SCENE_LIST` (2048) entries; generated/hidden folders are skipped.
 - Workspace authoring is disabled in Git presence mode and can be turned off with

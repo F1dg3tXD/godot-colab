@@ -47,6 +47,14 @@ var auto_apply_snapshot: bool = true
 ## the scene or clicks save.
 const PERSIST_DEBOUNCE_MS: int = 1200
 
+## A path-backed resource operation can arrive before the file that backs it
+## (for example when a resource is renamed: the reference update and the file
+## rename travel on separate channels). Instead of dropping the reference, keep
+## it pending and retry until the file exists, giving up after this long.
+const PENDING_RESOURCE_TIMEOUT_MS: int = 20000
+## Upper bound on pending resource references held at once.
+const MAX_PENDING_RESOURCES: int = 256
+
 var _coordinator: CollabSessionCoordinator
 var _logs: CollabLog
 var _editor: Dictionary = {}
@@ -55,6 +63,9 @@ var _primary_scene_id: String = ""
 var _aliases: Dictionary = {} # "peer:scene" -> {temp_id: authoritative_id}
 var _applying: bool = false
 var _pending_snapshot: Dictionary = {}
+## Resource property operations whose backing file does not exist locally yet:
+## [{ scene_id, node_id, property, value, since_ms }]. Retried every poll.
+var _pending_resources: Array[Dictionary] = []
 
 
 func setup(coordinator: CollabSessionCoordinator, logs: CollabLog, editor: Dictionary) -> void:
@@ -131,6 +142,7 @@ func detach_scene() -> void:
 	_scenes.clear()
 	_aliases.clear()
 	_pending_snapshot.clear()
+	_pending_resources.clear()
 	_primary_scene_id = ""
 	scene_id = ""
 	revision = 0
@@ -178,6 +190,7 @@ func poll() -> void:
 	if _coordinator == null or not _coordinator.session_manager.is_active():
 		return
 	var now: int = Time.get_ticks_msec()
+	_resolve_pending_resources(now)
 	for ctx in _scenes.values():
 		_configure(ctx)
 		ctx.diff_watcher.poll()
@@ -449,8 +462,10 @@ func _apply_create(op: Dictionary, ctx: CollabSceneContext) -> void:
 		t.origin = op.get("position", Vector3.ZERO)
 		t.basis = Basis.from_euler(op.get("rotation", Vector3.ZERO)).scaled(op.get("scale", Vector3.ONE))
 		(node as Node3D).transform = t
-	_apply_entry_props(node, op.get("props", {}), ctx)
+	# Register before applying properties so a deferred resource reference can
+	# resolve against this node's stable id on a later poll.
 	ctx.node_ids.register(node, authoritative_id)
+	_apply_entry_props(node, op.get("props", {}), ctx)
 	_mark_unsaved(ctx)
 
 
@@ -467,6 +482,7 @@ func _apply_entry_props(node: Node, props: Variant, ctx: CollabSceneContext) -> 
 		var kind: String = str(encoded.get("kind", ""))
 		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
 		if CollabSceneOperations.is_resource_kind(kind) and value == null:
+			_queue_pending_resource(ctx, ctx.node_ids.id_for(node), name, kind, encoded.get("value"))
 			continue
 		_apply_property_editor_safe(node, name, value, ctx)
 
@@ -531,9 +547,77 @@ func _apply_property(op: Dictionary, ctx: CollabSceneContext) -> void:
 	var kind: String = str(op.get("value_kind", ""))
 	var value: Variant = CollabSceneOperations.decode_value(kind, op.get("value", null))
 	if CollabSceneOperations.is_resource_kind(kind) and value == null:
+		if _queue_pending_resource(ctx, int(op.get("node_id", -1)), property, kind, op.get("value")):
+			return
 		conflict.emit("Resource for '%s' could not be resolved locally." % property)
 		return
+	_drop_pending_resource(ctx.scene_id, int(op.get("node_id", -1)), property)
 	_apply_property_editor_safe(node, property, value, ctx)
+
+
+## Records a path-backed resource reference whose target file is not on disk yet
+## so it can be retried once the file arrives. Returns true when the reference
+## was queued; false for inline payloads (which cannot appear later) or when the
+## queue is full, so the caller can report an immediate conflict instead.
+func _queue_pending_resource(ctx: CollabSceneContext, node_id: int, property: String, kind: String, raw_value: Variant) -> bool:
+	if kind != CollabSceneOperations.VALUE_RESOURCE:
+		return false
+	if node_id == -1 or ctx == null or _pending_resources.size() >= MAX_PENDING_RESOURCES:
+		return false
+	_drop_pending_resource(ctx.scene_id, node_id, property)
+	_pending_resources.append({
+		"scene_id": ctx.scene_id,
+		"node_id": node_id,
+		"property": property,
+		"value": raw_value,
+		"since_ms": Time.get_ticks_msec(),
+	})
+	status.emit("Waiting for resource '%s' referenced by '%s' to arrive." % [str(raw_value), property])
+	return true
+
+
+## Retries queued resource references. Entries that now resolve are applied
+## without echoing back into the operation stream; entries that stay unresolved
+## past the timeout are reported as conflicts and dropped.
+func _resolve_pending_resources(now: int) -> void:
+	if _pending_resources.is_empty():
+		return
+	var remaining: Array[Dictionary] = []
+	for entry in _pending_resources:
+		var ctx: CollabSceneContext = _scenes.get(str(entry.get("scene_id", "")))
+		if ctx == null:
+			continue
+		var node: Node = ctx.node_ids.node_for(int(entry.get("node_id", -1)), false)
+		if node == null:
+			continue
+		var property: String = str(entry.get("property", ""))
+		if not CollabSceneOperations.is_property_syncable(node, property):
+			continue
+		var value: Variant = CollabSceneOperations.decode_value(CollabSceneOperations.VALUE_RESOURCE, entry.get("value"))
+		if value != null:
+			ctx.diff_watcher.suspend()
+			_apply_property_editor_safe(node, property, value, ctx)
+			ctx.diff_watcher.resume()
+			status.emit("Resolved deferred resource for '%s'." % property)
+			continue
+		if now - int(entry.get("since_ms", now)) > PENDING_RESOURCE_TIMEOUT_MS:
+			conflict.emit("Resource '%s' for '%s' never arrived; reference was not applied." % [str(entry.get("value")), property])
+			continue
+		remaining.append(entry)
+	_pending_resources = remaining
+
+
+## Drops a queued reference for one (scene, node, property) so a newer value for
+## the same target never gets overwritten by a stale deferred one.
+func _drop_pending_resource(p_scene_id: String, node_id: int, property: String) -> void:
+	if _pending_resources.is_empty():
+		return
+	var kept: Array[Dictionary] = []
+	for entry in _pending_resources:
+		if str(entry.get("scene_id", "")) == p_scene_id and int(entry.get("node_id", 0)) == node_id and str(entry.get("property", "")) == property:
+			continue
+		kept.append(entry)
+	_pending_resources = kept
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +850,7 @@ func _apply_snapshot_props(ctx: CollabSceneContext, entry: Dictionary, node: Nod
 		var kind: String = str(encoded.get("kind", ""))
 		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
 		if CollabSceneOperations.is_resource_kind(kind) and value == null:
+			_queue_pending_resource(ctx, ctx.node_ids.id_for(node), prop, kind, encoded.get("value"))
 			continue
 		_apply_property_editor_safe(node, prop, value, ctx)
 

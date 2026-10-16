@@ -13,17 +13,20 @@ cd /path/to/godot-colab
 - Exit code `0` and a final `RESULT: PASS` mean all checks passed.
 - Exit code `1` with `RESULT: FAIL` means at least one check failed; each failure
   is printed individually.
-- The suite (currently **190 checks**) covers: protocol framing/validation (bad
+- The suite (currently **216 checks**) covers: protocol framing/validation (bad
   magic, truncated packets, oversized payloads, non-dictionary payloads, and the
   workspace message types `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/
-  `SCENE_LIST`, including text **and** byte payloads), invitation code
+  `FILE_REMOVE`/`SCENE_LIST`, including text **and** byte payloads), invitation code
   encode/decode, path guard (traversal/absolute/symlink), rate limiter, node-id
   allocation (positive authoritative ids, `-1` sentinel avoidance, no id reuse
   after `clear()`), general property value encode/decode (vectors, rects,
   transforms, AABBs, `StringName`, arrays, dictionaries; refusal of containers
   holding live `Object`s; **null object properties** encode as `null`; an
   **embedded-resource round-trip**), **inline-resource safety** (GDScript/
-  PackedScene/oversized/empty inline payloads refused), **settings defaults**
+  PackedScene/oversized/empty inline payloads refused), **pending-resource
+  queueing and resolution** (an unresolved path resource is queued, resolves on a
+  later poll, and times out to a conflict; the queue is capped),
+  **settings defaults**
   (empty rendezvous default, approval off by default, per-file cap ≤ packet cap),
   `is_syncable_property_name` (slash sub-properties allowed;
   `_`/`metadata/`/reserved refused) and `collect_syncable_props` behaviour
@@ -39,7 +42,11 @@ cd /path/to/godot-colab
   host/peer create/remove/transform edits propagate both ways without id
   collisions or duplicated nodes, a **general inspector-property** loopback test
   (`editor_description`/`process_priority` host→client, `visible` client→host,
-  plus an **inline `material_override`** host→client), a **rejoin-desync** test (a
+  plus an **inline `material_override`** host→client, an **in-place edit of that
+  embedded material's colour**, and an **in-place edit of a nested `BoxShape3D`
+  sub-resource** on a `CollisionShape3D`), a **workspace rename/delete** loopback
+  test (a file renamed on one peer converges to the new path with no duplicate and
+  the old path removed), a **rejoin-desync** test (a
   client with a stale local scene joins, is snapshotted, and its later edits
   target the correct node; then it reconnects with a fresh client and is re-keyed
   to host ids), and a **multi-scene isolation** test where the host is focused on
@@ -94,13 +101,15 @@ instances, enable **Godot Collab** in each, and run through the checks:
 1. **Enable/disable/reload.** Enable the plugin, then disable and re-enable it.
    No errors in the editor's Output panel; the dock disappears and reappears.
 2. **Top toolbar + host/client connect (loopback/LAN).** Confirm the top toolbar
-   shows **Host / Join / Copy Code / Request Snapshot / Disconnect** next to the
-   playtest buttons, and that Host/Join are disabled while a session is active and
-   Disconnect is disabled while disconnected. In Alice: set a username, click
-   **Host** in the toolbar, then **Copy Code**. In Bob: paste the code into the
-   dock's session-code field, click **Join** in the toolbar. Both docks show
-   *Connected*. (With the default approval-off, no prompt appears; enable *Require
-   host approval* in the dock to test the approval prompt path.)
+   shows **Host / Join / Paste & Join / Copy Code / Request Snapshot / Disconnect**
+   next to the playtest buttons, and that Host/Join/Paste & Join are disabled while
+   a session is active and Disconnect is disabled while disconnected. In Alice: set
+   a username, click **Host** in the toolbar, then **Copy Code**. In Bob: click
+   **Paste & Join** in the toolbar (this reads the clipboard) or paste the code into
+   the dock's session-code field and click **Join**. Both docks show *Connected*.
+   (With the default approval-off, no prompt appears; enable *Require host
+   approval* in the dock to test the approval prompt path — the client dock should
+   show "Waiting for host approval".)
 3. **Usernames + participant list.** Both docks list two participants with the
    correct names and host/client roles.
 4. **Remote cursors.** Move the mouse over Alice's 3D viewport: Bob sees a
@@ -151,10 +160,18 @@ instances, enable **Godot Collab** in each, and run through the checks:
 8d. **Resources + binary asset sync.** On one peer, assign a new material (create
     a `StandardMaterial3D` in the Inspector, or drag a texture from the
     Filesystem dock onto a `MeshInstance3D`'s `Material Override`) and confirm it
-    appears on the other peer. Edit that material's colour in place and confirm
-    the change propagates. Set `surface_material_override/0` and confirm it
-    propagates. Separately, drop a binary image/model/audio file into the
-    Filesystem dock and confirm both peers get a local copy.
+    appears on the other peer. Edit that material's colour **in place** and confirm
+    the change propagates (allow up to ~1.5 s). Edit a `CollisionShape3D`'s
+    `shape` size in place and confirm it propagates. Set
+    `surface_material_override/0` and confirm it propagates. Separately, drop a
+    binary image/model/audio file into the Filesystem dock and confirm both peers
+    get a local copy.
+8f. **File rename/delete propagation.** With the session running, rename a synced
+    source file (e.g. a `.gd` script) on one peer. Confirm the other peer ends up
+    with the file at the **new** path and **not** the old path (no duplicate or
+    stale file). Then delete a synced file on one peer and confirm it is removed
+    on the other. Confirm that an **open** scene file is still protected (a
+    rename/delete of an open scene does not corrupt the editor's tab).
 8e. **Open-scene protection.** Open `res://scenes/test.tscn` on the host and have
     the client save a change to that same scene file path: confirm the operation
     stream carries the change and the raw file watcher does not double-write it.

@@ -14,6 +14,9 @@ signal participants_changed()
 signal peer_ready(peer_id: int)
 signal join_request(peer_id: int, username: String, project_id: String)
 signal join_resolved(peer_id: int, approved: bool)
+## Client side: the host received our request and is waiting for the operator to
+## approve or reject it.
+signal join_pending()
 signal cursor_received(peer_id: int, payload: Dictionary)
 signal scene_message(peer_id: int, type: int, payload: Dictionary)
 signal save_message(peer_id: int, type: int, payload: Dictionary)
@@ -51,6 +54,7 @@ const WORKSPACE_MESSAGE_TYPES: Array[int] = [
 	CollabProtocol.MessageType.WORKSPACE_RESULT,
 	CollabProtocol.MessageType.FILE_APPLY,
 	CollabProtocol.MessageType.SCENE_LIST,
+	CollabProtocol.MessageType.FILE_REMOVE,
 ]
 
 var session_manager: CollabSessionManager
@@ -240,6 +244,9 @@ func _on_message(from_peer: int, type: CollabProtocol.MessageType, payload: Dict
 		_on_welcome(from_peer, payload)
 	elif t == CollabProtocol.MessageType.REJECT:
 		_on_reject(payload)
+	elif t == CollabProtocol.MessageType.JOIN_PENDING:
+		if not _is_host:
+			join_pending.emit()
 	elif t == CollabProtocol.MessageType.PARTICIPANT_JOIN:
 		_on_participant_join(payload)
 	elif t == CollabProtocol.MessageType.PARTICIPANT_LEAVE:
@@ -283,6 +290,7 @@ func _on_hello(peer_id: int, payload: Dictionary) -> void:
 	_pending[peer_id] = payload
 	var name := _sanitize_name(str(payload.get("username", "")))
 	if approve_joins:
+		session_manager.send_to(peer_id, CollabProtocol.MessageType.JOIN_PENDING, {})
 		join_request.emit(peer_id, name, str(payload.get("project_id", "")))
 		_notice("Join request from '%s' (%d) - awaiting approval." % [name, peer_id])
 	else:

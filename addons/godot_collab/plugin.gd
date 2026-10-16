@@ -243,6 +243,7 @@ func _build_toolbar() -> void:
 	add_control_to_container(EditorPlugin.CONTAINER_TOOLBAR, _toolbar)
 	_toolbar.host_requested.connect(_dock.request_host)
 	_toolbar.join_requested.connect(_dock.request_join)
+	_toolbar.paste_join_requested.connect(_dock.request_paste_join)
 	_toolbar.copy_requested.connect(_dock.request_copy)
 	_toolbar.snapshot_requested.connect(_on_snapshot_requested)
 	_toolbar.disconnect_requested.connect(_on_disconnect_requested)
@@ -325,16 +326,16 @@ func _on_join_requested(invite: String) -> void:
 	var parsed: Dictionary = CollabInviteCode.decode(invite)
 	var kind: String = str(parsed.get("kind", "invalid"))
 	if kind == "invalid":
-		_dock.push_message("Invalid invitation: %s" % str(parsed.get("error", "unknown")), true)
+		_dock.push_message("Invalid invitation code '%s': %s" % [invite, str(parsed.get("error", "unknown"))], true)
 		return
 	_coordinator.username = _settings.get_string(CollabSettings.KEY_USERNAME, "peer")
 	if kind == "short":
 		if not _rendezvous.is_configured():
-			_dock.push_message("This is a short code but no rendezvous service is configured.", true)
+			_dock.push_message("Code '%s' is a short code but no rendezvous service is configured." % str(parsed.get("code", "")), true)
 			return
 		_coordinator.require_token = true
 		_pending_lookup = true
-		_dock.push_message("Resolving code %s..." % str(parsed.get("code", "")), false)
+		_dock.push_message("Resolving short code %s via the rendezvous service..." % str(parsed.get("code", "")), false)
 		_rendezvous.lookup(str(parsed.get("code", "")))
 		return
 	_pending_lookup = false
@@ -357,12 +358,20 @@ func _on_rendezvous_lookup(code: String, ok: bool, data: Dictionary, error: Stri
 
 func _join_endpoint(host: String, port: int, token: String, mode: int) -> void:
 	if host.is_empty() or port <= 0:
-		_dock.push_message("Invitation is missing a host or port.", true)
+		_dock.push_message("Invitation is missing a host or port (got '%s:%d')." % [host, port], true)
 		return
 	_coordinator.workspace_mode = mode
+	_dock.set_connection_status(CollabConstants.ConnectionState.CONNECTING, "Connecting to %s:%d" % [host, port])
+	_dock.push_message("Connecting to host at %s:%d..." % [host, port], false)
 	var err: Error = _coordinator.join(host, port, token)
 	if err != OK:
+		_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
 		_dock.push_message("Failed to connect to %s:%d: %s" % [host, port, error_string(err)], true)
+
+
+func _on_join_pending() -> void:
+	_dock.set_connection_status(CollabConstants.ConnectionState.CONNECTING, "Waiting for host approval")
+	_dock.push_message("Connected to the host. Waiting for the host to approve your join request...", false)
 
 
 func _on_disconnect_requested() -> void:
@@ -463,6 +472,7 @@ func _wire_coordinator() -> void:
 	_coordinator.participants_changed.connect(_on_participants_changed)
 	_coordinator.join_request.connect(_on_join_request)
 	_coordinator.join_resolved.connect(_on_join_resolved)
+	_coordinator.join_pending.connect(_on_join_pending)
 	_coordinator.compatibility_warning.connect(_on_compatibility_warning)
 	_coordinator.notice.connect(_on_notice)
 	_coordinator.error_raised.connect(_on_error)

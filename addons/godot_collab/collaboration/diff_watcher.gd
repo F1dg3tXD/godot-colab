@@ -14,6 +14,12 @@ signal operations_detected(ops: Array)
 const SCAN_INTERVAL: float = 0.25
 const MAX_NODES: int = 4000
 const TRANSFORM_EPSILON: float = 0.0001
+## How often embedded (path-less) resources are re-serialised to catch in-place
+## edits. Most Resource subclasses (materials, environments, meshes) do NOT emit
+## their "changed" signal for ordinary property edits, so a content comparison on
+## a slow cadence is the only reliable trigger. Kept slower than the node scan so
+## the serialisation cost stays off the hot path.
+const DEEP_RESOURCE_INTERVAL: float = 1.5
 
 var enabled: bool = false
 var is_host: bool = false
@@ -32,11 +38,13 @@ var _over_budget_warned: bool = false
 var _root_id: int = -1
 ## Embedded resources referenced by the current scan, keyed by instance id:
 ## { res_id: { resource: Resource, targets: [{node, property}] } }. Rebuilt every
-## scan so a resource's "changed" signal can be used to catch in-place edits
-## (which a reference-only signature would miss).
+## scan so in-place edits can be caught by a content comparison (a reference-only
+## signature would miss them).
 var _scan_bindings: Dictionary = {}
-## Live "changed" connections: res_id -> { resource: Resource, callable: Callable }.
-var _res_conns: Dictionary = {}
+## Last serialised content of each bound embedded resource: res_id -> String.
+## Compared on [_deep_scan_resources] to detect in-place edits.
+var _res_sigs: Dictionary = {}
+var _deep_last_ms: int = 0
 
 
 func setup(node_ids: CollabNodeIdMap) -> void:
@@ -77,10 +85,12 @@ func poll() -> void:
 	if not enabled or _suspended or _root == null or not is_instance_valid(_root):
 		return
 	var now := Time.get_ticks_msec()
-	if now - _last_scan_ms < int(SCAN_INTERVAL * 1000.0):
-		return
-	_last_scan_ms = now
-	_scan()
+	if now - _last_scan_ms >= int(SCAN_INTERVAL * 1000.0):
+		_last_scan_ms = now
+		_scan()
+	if now - _deep_last_ms >= int(DEEP_RESOURCE_INTERVAL * 1000.0):
+		_deep_last_ms = now
+		_deep_scan_resources()
 
 
 func _scan() -> void:
@@ -116,7 +126,6 @@ func _scan() -> void:
 			if node_id != 0:
 				ops.append(CollabSceneOperations.make_remove_op(local_peer_id, _next_op_id(), scene_id, base_revision, node_id))
 	_baseline = next_baseline
-	_sync_resource_connections()
 	if not ops.is_empty():
 		operations_detected.emit(ops)
 
@@ -258,61 +267,57 @@ func _record_bindings(node: Node, entry: Dictionary) -> void:
 			continue
 		if not _scan_bindings.has(res_id):
 			_scan_bindings[res_id] = {"resource": resource, "targets": []}
+			# Anchor the content signature the moment the resource is first seen.
+			# If this were left to the periodic deep scan, an edit made before that
+			# scan runs would be folded into the baseline and silently lost.
+			if not _res_sigs.has(res_id):
+				var encoded_res: Dictionary = CollabSceneOperations.encode_value(resource)
+				if encoded_res["kind"] == CollabSceneOperations.VALUE_RESOURCE_INLINE:
+					_res_sigs[res_id] = str(encoded_res["value"])
 		(_scan_bindings[res_id]["targets"] as Array).append({"node": node, "property": str(prop)})
 
 
-func _sync_resource_connections() -> void:
-	for res_id in _res_conns.keys():
-		if _scan_bindings.has(res_id):
-			continue
-		var tracked: Dictionary = _res_conns[res_id]
-		var resource: Resource = tracked.get("resource")
-		var callback: Callable = tracked.get("callable")
-		if resource != null and callback.is_valid() and resource.changed.is_connected(callback):
-			resource.changed.disconnect(callback)
-		_res_conns.erase(res_id)
-	for res_id in _scan_bindings.keys():
-		if _res_conns.has(res_id):
-			continue
-		var resource: Resource = _scan_bindings[res_id].get("resource")
-		if resource == null:
-			continue
-		var callback: Callable = _on_resource_changed.bind(res_id)
-		resource.changed.connect(callback)
-		_res_conns[res_id] = {"resource": resource, "callable": callback}
-
-
-## Emits property operations for an embedded resource edited in place. The
-## reference-based signature does not change for these, so the resource's
-## "changed" signal is the only reliable trigger.
-func _on_resource_changed(res_id: int) -> void:
-	if not enabled or _suspended:
+## Re-serialises every bound embedded resource and emits property operations for
+## any whose content changed since the previous pass. This replaces relying on
+## [signal Resource.changed], which most Resource subclasses (materials,
+## environments, meshes) never emit for ordinary property edits. The first pass
+## for a resource only records its signature so it does not re-send on bind.
+func _deep_scan_resources() -> void:
+	if _scan_bindings.is_empty():
+		_res_sigs.clear()
 		return
-	var binding: Variant = _scan_bindings.get(res_id)
-	if binding == null:
-		return
+	var next_sigs: Dictionary = {}
 	var ops: Array = []
-	for target in (binding["targets"] as Array):
-		var node: Node = target.get("node")
-		if not is_instance_valid(node):
+	for res_id in _scan_bindings.keys():
+		var binding: Dictionary = _scan_bindings[res_id]
+		var resource: Resource = binding.get("resource") as Resource
+		if resource == null or not is_instance_valid(resource):
 			continue
-		var prop: String = str(target.get("property", ""))
-		var encoded: Dictionary = CollabSceneOperations.encode_value(node.get(prop))
+		var encoded: Dictionary = CollabSceneOperations.encode_value(resource)
 		if encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
 			continue
-		ops.append(CollabSceneOperations.make_property_op(local_peer_id, _next_op_id(), scene_id, base_revision, _ensure_id(node), prop, encoded))
+		var signature: String = str(encoded["value"])
+		next_sigs[res_id] = signature
+		if not _res_sigs.has(res_id):
+			continue
+		if str(_res_sigs[res_id]) == signature:
+			continue
+		for target in (binding["targets"] as Array):
+			var node: Node = target.get("node")
+			if not is_instance_valid(node):
+				continue
+			var prop: String = str(target.get("property", ""))
+			var target_encoded: Dictionary = CollabSceneOperations.encode_value(node.get(prop))
+			if target_encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
+				continue
+			ops.append(CollabSceneOperations.make_property_op(local_peer_id, _next_op_id(), scene_id, base_revision, _ensure_id(node), prop, target_encoded))
+	_res_sigs = next_sigs
 	if not ops.is_empty():
 		operations_detected.emit(ops)
 
 
 func _clear_resource_tracking() -> void:
-	for res_id in _res_conns.keys():
-		var tracked: Dictionary = _res_conns[res_id]
-		var resource: Resource = tracked.get("resource")
-		var callback: Callable = tracked.get("callable")
-		if resource != null and callback.is_valid() and resource.changed.is_connected(callback):
-			resource.changed.disconnect(callback)
-	_res_conns.clear()
+	_res_sigs.clear()
 	_scan_bindings.clear()
 
 

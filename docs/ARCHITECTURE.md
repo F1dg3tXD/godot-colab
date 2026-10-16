@@ -109,8 +109,9 @@ Saving: `SAVE_REQUEST`, `SAVE_RESULT`.
 Transfer: `TRANSFER_MANIFEST`, `TRANSFER_REQUEST`, `TRANSFER_CHUNK`,
 plus completion/error types.
 Workspace authoring: `WORKSPACE_REQUEST` (client → host: create scene / add
-file / list scenes), `WORKSPACE_RESULT` (host → peers: accept/reject),
-`FILE_APPLY` (host → peers: canonical file bytes), `SCENE_LIST`.
+file / delete file / list scenes), `WORKSPACE_RESULT` (host → peers:
+accept/reject), `FILE_APPLY` (host → peers: canonical file bytes),
+`FILE_REMOVE` (host → peers: a synced file was removed), `SCENE_LIST`.
 
 Best-effort traffic (cursor updates) uses `TRANSFER_MODE_UNRELIABLE_ORDERED`;
 everything else uses `TRANSFER_MODE_RELIABLE`. Control and file-transfer data
@@ -125,7 +126,9 @@ also use distinct channels via `set_transfer_channel`.
    invite token is compared in constant time. Protocol-version mismatches and
    unknown/invalid payloads are rejected with a reason.
 4. If `approve_joins` is enabled the host emits `join_request` (shown in the
-   dock as pending). On approval the host registers the participant, sends
+   dock as pending) and sends the connecting client a `JOIN_PENDING`, so the
+   client's dock shows "Waiting for host approval" instead of an ambiguous
+   "Connecting…". On approval the host registers the participant, sends
    `WELCOME` (`peer_id`, `session_id`, `host_username`, `workspace_mode`,
    `project_id`, …), sends `JOIN_APPROVED`, and broadcasts the participant list.
 5. On `WELCOME` the client adopts its assigned id and registers the host.
@@ -209,14 +212,31 @@ overwriting whole `.tscn` files is not an acceptable design. Instead:
   `.tres`, loads it, and deletes it. Both directions refuse payloads containing
   executable/referenced content (`type="script"`, `type="packedscene"`,
   `script = ExtResource`, …) so an inline resource can never carry code. A peer
-  that cannot resolve a resource emits a conflict instead of clearing the
-  property.
+  that cannot resolve a **path-backed** resource (the file has not arrived yet)
+  does not clear the property; it queues the operation as a *pending resource*
+  (`PENDING_RESOURCE_TIMEOUT_MS = 20 s`, capped at `MAX_PENDING_RESOURCES`) and
+  retries every poll until the resource resolves, then drops it and reports a
+  conflict if the timeout elapses. This lets a create-op that references a
+  resource delivered moments later still converge.
 - **Cheap baseline vs. full value.** The diff watcher's per-scan baseline stores
   a *comparison-only* projection (`signature_value`): embedded resources are
   reduced to their instance id, so a scan never serialises every resource. The
   full wire value is materialised (`encode_value`) only for a property that
-  actually changed. In-place edits to an embedded resource (its reference does
-  not change) are caught by connecting to the resource's `changed` signal.
+  actually changed.
+- **Nested/in-place resource edits.** An in-place edit to an embedded resource
+  (changing a material's colour, a `BoxShape3D`'s size, an `Environment`'s mode)
+  does not change the node's property reference, so the cheap baseline alone
+  cannot see it. The obvious trigger — `Resource.changed` — is unreliable:
+  verified on 4.7.2, most resource types (`StandardMaterial3D`, `Environment`)
+  never emit it for ordinary property edits (only some, like `BoxShape3D`, do).
+  The watcher therefore re-serialises every bound embedded resource on a slower
+  cadence (`DEEP_RESOURCE_INTERVAL = 1.5 s`) and emits a property op for any
+  whose content changed. The content signature for a resource is anchored the
+  moment it is first bound (not lazily at the next deep scan), so an edit made
+  between the bind and the first deep scan is not silently folded into the
+  baseline. Cost is bounded to the embedded resources actually referenced by the
+  scene; nested sub-resources (e.g. `Environment`→`Sky`→material) are covered
+  because the whole resource graph is re-serialised.
 - **Cleared object properties.** An object-typed property that is null reports
   `TYPE_OBJECT` with a null value; `encode_value` maps that to `VALUE_NULL` (not
   `unsupported`) so the property stays in the collected set. Otherwise a
@@ -307,6 +327,22 @@ A request may carry a UTF-8 `text` payload (text files) or a raw `data`
 `PackedByteArray` (a binary asset dropped into the Filesystem dock); both are
 size-checked. Files delivered this way are never executed or imported by the
 add-on; they become ordinary project files the user's editor may scan.
+
+### File rename and delete propagation
+
+The file watcher (`_scan_and_sync`) compares the current stat baseline against
+the project and relays **additions/changes first, then removals**. A removal is
+relayed the same way an addition is: on the host via `_host_delete_file()` (which
+re-validates the path is writable and inside the approved root, deletes it with
+`DirAccess.remove_absolute`, erases the baseline entry, bumps the revision, and
+broadcasts `FILE_REMOVE`), and on a client as a `WORKSPACE_REQUEST` with
+`WorkspaceOp.DELETE_FILE`. Receivers apply `FILE_REMOVE` through
+`_apply_incoming_remove()` (validate, skip protected open scenes, delete, refresh
+the filesystem). This makes a **rename** (handled implicitly as add-then-delete
+rather than a dedicated op) converge: the new path is delivered before the old
+path is removed, so a path-backed reference always resolves. `_refresh_baseline_entry`
+erases a baseline entry when its file is gone, so a received removal is never
+re-detected locally and echoed back.
 
 Setting `godot_collab/collaboration/allow_workspace_authoring` (default on)
 gates the whole feature; it is always disabled in Git presence mode.

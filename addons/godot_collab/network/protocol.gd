@@ -59,6 +59,7 @@ enum MessageType {
 	WORKSPACE_RESULT = 71, ## host -> peers: accepted/rejected request
 	FILE_APPLY = 72, ## host -> peers: write this file content locally
 	SCENE_LIST = 73, ## host -> peers: known project scenes
+	FILE_REMOVE = 74, ## host -> peers: delete this project file locally (rename/delete)
 }
 
 ## Named reasons a peer can be rejected or an operation refused.
@@ -238,6 +239,11 @@ static func _validate_payload(type: MessageType, payload: Dictionary) -> String:
 				return "SCENE_LIST missing scenes"
 			if (payload["scenes"] as Array).size() > CollabConstants.MAX_SCENE_LIST:
 				return "SCENE_LIST too large"
+		MessageType.FILE_REMOVE:
+			if not _has_keys(payload, ["path"]):
+				return "FILE_REMOVE missing fields"
+			if not _check_str(payload, "path", 512):
+				return "FILE_REMOVE bad path"
 		_:
 			pass
 	return ""
@@ -266,7 +272,7 @@ static func _check_int(payload: Dictionary, key: String) -> bool:
 
 
 static func _type_count() -> int:
-	return MessageType.SCENE_LIST + 1
+	return MessageType.FILE_REMOVE + 1
 
 
 static func _append_u32(buf: PackedByteArray, value: int) -> void:

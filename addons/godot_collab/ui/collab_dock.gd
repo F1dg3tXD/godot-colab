@@ -170,7 +170,8 @@ func _build() -> void:
 
 	var join_box := _section("Join")
 	_invite_input = LineEdit.new()
-	_invite_input.placeholder_text = "Paste invitation code or host:port, then press Join in the toolbar"
+	_invite_input.placeholder_text = "Paste an invitation code or host:port, then press Paste & Join in the toolbar"
+	_invite_input.text_submitted.connect(func(_text: String) -> void: _on_join_pressed())
 	join_box.add_child(_invite_input)
 
 	var participants_box := _section("Participants")
@@ -399,6 +400,18 @@ func request_join() -> void:
 	_on_join_pressed()
 
 
+## Toolbar entry point: pastes an invitation code from the clipboard into the
+## dock's code field and joins immediately.
+func request_paste_join() -> void:
+	var clipboard: String = DisplayServer.clipboard_get().strip_edges()
+	if clipboard.is_empty():
+		push_message("Clipboard is empty. Copy an invitation code first.", true)
+		return
+	_invite_input.text = clipboard
+	push_message("Pasted invitation code from clipboard.", false)
+	_on_join_pressed()
+
+
 ## Toolbar entry point: copies the generated invitation code.
 func request_copy() -> void:
 	_on_copy_pressed()
@@ -418,8 +431,9 @@ func _on_host_pressed() -> void:
 func _on_join_pressed() -> void:
 	var invite: String = _invite_input.text.strip_edges()
 	if invite.is_empty():
-		push_message("Enter an invitation code or host:port.", true)
+		push_message("Enter or paste an invitation code (or host:port), then try again.", true)
 		return
+	push_message("Joining with code '%s'..." % invite, false)
 	join_requested.emit(invite)
 
 

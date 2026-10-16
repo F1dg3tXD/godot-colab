@@ -256,12 +256,14 @@ func _init() -> void:
 	_test_node_id_map()
 	_test_property_values()
 	_test_inline_resource_safety()
+	_test_pending_resource_resolution()
 	_test_settings_defaults()
 	_test_filesync_paths()
 	_test_id_reconciliation()
 	_test_loopback_session()
 	_test_scene_sync_loopback()
 	_test_general_property_sync()
+	_test_workspace_rename_delete_loopback()
 	_test_rejoin_desync()
 	_test_multi_scene_isolation()
 	_test_marker_manager()
@@ -299,6 +301,72 @@ func _test_inline_resource_safety() -> void:
 	_check(CollabSceneOperations.decode_value(kind, "") == null, "empty inline payload is refused")
 	var oversized: String = "x".repeat(CollabSceneOperations.MAX_INLINE_RESOURCE_TEXT + 1)
 	_check(CollabSceneOperations.decode_value(kind, oversized) == null, "oversized inline payload is refused")
+
+
+## A path-backed resource reference that arrives before its file (the classic
+## rename ordering) must be queued and applied once the file exists, not dropped.
+func _test_pending_resource_resolution() -> void:
+	print("[pending resource resolution]")
+	var logs := CollabLog.new()
+	var manager := CollabSessionManager.new(logs)
+	var coordinator := CollabSessionCoordinator.new()
+	coordinator.setup(manager, logs)
+	var noop := func() -> void: pass
+	var sync := CollabSceneSyncService.new()
+	var conflicts: Dictionary = {"count": 0}
+	sync.conflict.connect(func(_text: String) -> void: conflicts["count"] += 1)
+	sync.setup(coordinator, logs, {"get_edited_root": func() -> Node: return null, "mark_unsaved": noop})
+
+	var root := Node3D.new()
+	root.name = "Root"
+	var mesh := MeshInstance3D.new()
+	mesh.name = "Mesh"
+	root.add_child(mesh)
+	sync.attach_scene(root, "res://pending.tscn")
+	var ctx: Variant = sync._scenes.get("res://pending.tscn")
+	_check(ctx != null, "pending test scene context exists")
+	if ctx == null:
+		sync.free()
+		coordinator.free()
+		manager.free()
+		root.free()
+		return
+	var node_id: int = sync.node_id_for_scene("res://pending.tscn", mesh)
+	_check(node_id != -1, "pending test node has an id")
+
+	var missing_path: String = "user://collab_pending_%d.tres" % Time.get_ticks_usec()
+	var queued: bool = sync._queue_pending_resource(ctx, node_id, "material_override", CollabSceneOperations.VALUE_RESOURCE, missing_path)
+	_check(queued, "unresolved path resource is queued")
+	_check(sync._pending_resources.size() == 1, "one pending reference held")
+
+	# Retrying before the file exists keeps it queued and emits no conflict yet.
+	sync._resolve_pending_resources(Time.get_ticks_msec())
+	_check(sync._pending_resources.size() == 1, "pending reference survives while unresolved")
+	_check(int(conflicts["count"]) == 0, "no conflict emitted before the timeout")
+
+	# Once the file exists the reference resolves and is applied.
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.1, 0.8, 0.4)
+	ResourceSaver.save(material, missing_path)
+	sync._resolve_pending_resources(Time.get_ticks_msec())
+	_check(sync._pending_resources.is_empty(), "pending reference clears once the file arrives")
+	var applied := mesh.material_override as StandardMaterial3D
+	_check(applied != null and applied.albedo_color.is_equal_approx(Color(0.1, 0.8, 0.4)), "deferred resource was applied to the node")
+
+	# A reference that never arrives is reported and dropped after the timeout.
+	_check(sync._queue_pending_resource(ctx, node_id, "material_override", CollabSceneOperations.VALUE_RESOURCE, "user://never_arrives_%d.tres" % Time.get_ticks_usec()), "second unresolved resource is queued")
+	for entry in sync._pending_resources:
+		entry["since_ms"] = Time.get_ticks_msec() - CollabSceneSyncService.PENDING_RESOURCE_TIMEOUT_MS - 1
+	sync._resolve_pending_resources(Time.get_ticks_msec())
+	_check(sync._pending_resources.is_empty(), "timed-out reference is dropped")
+	_check(int(conflicts["count"]) >= 1, "timed-out reference is reported as a conflict")
+
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(missing_path))
+	sync.detach_scene()
+	root.free()
+	sync.free()
+	coordinator.free()
+	manager.free()
 
 
 func _test_settings_defaults() -> void:
@@ -379,6 +447,12 @@ func _test_protocol() -> void:
 		"path": "a.tscn", "data": "not bytes", "scene": true,
 	})
 	_check(not bool(CollabProtocol.decode(bad_file_apply).get("ok", true)), "file apply rejects non-byte data")
+	var file_remove: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.FILE_REMOVE, {"path": "old.tres"})
+	var remove_decoded: Dictionary = CollabProtocol.decode(file_remove)
+	_check(bool(remove_decoded.get("ok", false)), "file remove validated")
+	_check(int(remove_decoded.get("type", -1)) == CollabProtocol.MessageType.FILE_REMOVE, "file remove type preserved")
+	var bad_file_remove: PackedByteArray = CollabProtocol.encode(CollabProtocol.MessageType.FILE_REMOVE, {"path": 12})
+	_check(not bool(CollabProtocol.decode(bad_file_remove).get("ok", true)), "file remove rejects non-string path")
 
 
 func _test_invite_codes() -> void:
@@ -919,6 +993,44 @@ func _test_general_property_sync() -> void:
 		return received != null and received.albedo_color.is_equal_approx(Color(0.9, 0.1, 0.3)))
 	_check(resource_synced, "host inline material_override reached the client as a rebuilt resource")
 
+	# Editing that embedded material in place (change its colour) changes no node
+	# reference, and StandardMaterial3D never emits its "changed" signal for this,
+	# so it is only caught by the watcher's periodic content re-serialisation.
+	# This is the "nested node properties" case: no file exists, yet the edit must
+	# travel.
+	if material != null:
+		material.albedo_color = Color(0.05, 0.95, 0.15)
+	var nested_edit: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		var client_mesh: MeshInstance3D = client_root.get_node_or_null("Mesh") as MeshInstance3D
+		if client_mesh == null:
+			return false
+		var received := client_mesh.material_override as StandardMaterial3D
+		return received != null and received.albedo_color.is_equal_approx(Color(0.05, 0.95, 0.15)))
+	_check(nested_edit, "in-place edit of an embedded material propagated to the client")
+
+	# A sub-resource owned by a node (a BoxShape3D on a CollisionShape3D) is also
+	# embedded; both its initial value and its later nested edits must travel.
+	var host_shape := CollisionShape3D.new()
+	host_shape.name = "Hull"
+	var box := BoxShape3D.new()
+	box.size = Vector3(1, 2, 3)
+	host_shape.shape = box
+	host_root.add_child(host_shape)
+	var shape_synced: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		var cs: CollisionShape3D = client_root.get_node_or_null("Hull") as CollisionShape3D
+		if cs == null or not (cs.shape is BoxShape3D):
+			return false
+		return (cs.shape as BoxShape3D).size.is_equal_approx(Vector3(1, 2, 3)))
+	_check(shape_synced, "nested BoxShape3D sub-resource reached the client with its size")
+
+	box.size = Vector3(4, 5, 6)
+	var shape_edit: bool = _pump(host, client, host_sync, client_sync, 6000, func() -> bool:
+		var cs: CollisionShape3D = client_root.get_node_or_null("Hull") as CollisionShape3D
+		if cs == null or not (cs.shape is BoxShape3D):
+			return false
+		return (cs.shape as BoxShape3D).size.is_equal_approx(Vector3(4, 5, 6)))
+	_check(shape_edit, "in-place edit of a nested sub-resource reached the client")
+
 	client_sync.detach_scene()
 	host_sync.detach_scene()
 	client.stop("cleanup")
@@ -929,6 +1041,126 @@ func _test_general_property_sync() -> void:
 	client.free()
 	host_manager.free()
 	client_manager.free()
+
+
+## Drives two peers plus their workspace services until [param done] is true.
+func _pump_workspaces(host: CollabSessionCoordinator, client: CollabSessionCoordinator, host_ws: CollabWorkspaceService, client_ws: CollabWorkspaceService, timeout_ms: int, done: Callable) -> bool:
+	var deadline: int = Time.get_ticks_msec() + timeout_ms
+	while Time.get_ticks_msec() < deadline:
+		host.poll()
+		client.poll()
+		host_ws.poll()
+		client_ws.poll()
+		if done.call():
+			return true
+		OS.delay_msec(5)
+	return bool(done.call())
+
+
+func _reset_dir(path: String) -> void:
+	if DirAccess.dir_exists_absolute(path):
+		_remove_tree(path)
+	DirAccess.make_dir_recursive_absolute(path)
+
+
+func _remove_tree(path: String) -> void:
+	var dir: DirAccess = DirAccess.open(path)
+	if dir == null:
+		return
+	dir.list_dir_begin()
+	var entry: String = dir.get_next()
+	while entry != "":
+		var abs: String = path.path_join(entry)
+		if dir.current_is_dir():
+			_remove_tree(abs)
+		else:
+			DirAccess.remove_absolute(abs)
+		entry = dir.get_next()
+	dir.list_dir_end()
+	DirAccess.remove_absolute(path)
+
+
+## Reproduces the reported rename desync: a client renames a resource file (or
+## deletes a file) and the host must converge to the new name and drop the old
+## copy, instead of keeping both.
+func _test_workspace_rename_delete_loopback() -> void:
+	print("[workspace rename/delete loopback]")
+	var logs := CollabLog.new()
+	var port: int = 45984
+
+	var host_root: String = "/tmp/opencode/wsrename_host"
+	var client_root: String = "/tmp/opencode/wsrename_client"
+	_reset_dir(host_root)
+	_reset_dir(client_root)
+
+	var material_text: String = "[gd_resource type=\"StandardMaterial3D\" format=3]\n\n[resource]\nalbedo_color = Color(0.2, 0.4, 0.8, 1)\n"
+	_write_text(host_root.path_join("mat_old.tres"), material_text)
+	_write_text(client_root.path_join("mat_old.tres"), material_text)
+	_write_text(host_root.path_join("scripts/util.gd"), "extends Node\n")
+	_write_text(client_root.path_join("scripts/util.gd"), "extends Node\n")
+
+	var host_manager := CollabSessionManager.new(logs)
+	var host := CollabSessionCoordinator.new()
+	host.setup(host_manager, logs)
+	var client_manager := CollabSessionManager.new(logs)
+	var client := CollabSessionCoordinator.new()
+	client.setup(client_manager, logs)
+
+	host.get_project_id = func() -> String: return "proj"
+	host.get_scene_id = func() -> String: return "res://w.tscn"
+	host.get_username = func() -> String: return "host"
+	client.get_project_id = func() -> String: return "proj"
+	client.get_scene_id = func() -> String: return "res://w.tscn"
+	client.get_username = func() -> String: return "peer"
+
+	var host_ws := CollabWorkspaceService.new()
+	host_ws.setup(host, CollabSettings.new(), logs, func() -> String: return host_root, {})
+	var client_ws := CollabWorkspaceService.new()
+	client_ws.setup(client, CollabSettings.new(), logs, func() -> String: return client_root, {})
+
+	var err: Error = host.start_host(port, 4, CollabConstants.WorkspaceMode.HOST_WORKSPACE, false)
+	_check(err == OK, "rename host starts (%s)" % error_string(err))
+	err = client.join("127.0.0.1", port, "")
+	_check(err == OK, "rename client joins (%s)" % error_string(err))
+
+	var ready: bool = _pump_workspaces(host, client, host_ws, client_ws, 6000, func() -> bool:
+		return host.registry.count() >= 2 and client.registry.count() >= 2)
+	_check(ready, "rename peers connected")
+
+	# Prime baselines only after both peers already have the same files, so the
+	# initial state is not treated as a change.
+	host_ws.prime_file_baseline()
+	client_ws.prime_file_baseline()
+	host_ws.file_sync_enabled = true
+	client_ws.file_sync_enabled = true
+	host_ws._watch_last_ms = 0
+	client_ws._watch_last_ms = 0
+
+	# The client renames the resource and deletes the script.
+	DirAccess.rename_absolute(client_root.path_join("mat_old.tres"), client_root.path_join("mat_new.tres"))
+	DirAccess.remove_absolute(client_root.path_join("scripts/util.gd"))
+
+	var host_mat: String = host_root.path_join("mat_new.tres")
+	var host_old: String = host_root.path_join("mat_old.tres")
+	var host_util: String = host_root.path_join("scripts/util.gd")
+	var converged: bool = _pump_workspaces(host, client, host_ws, client_ws, 9000, func() -> bool:
+		return FileAccess.file_exists(host_mat) and not FileAccess.file_exists(host_old) and not FileAccess.file_exists(host_util))
+	_check(FileAccess.file_exists(host_mat), "renamed file arrived on the host")
+	_check(not FileAccess.file_exists(host_old), "renamed-away file was removed on the host (no stale duplicate)")
+	_check(not FileAccess.file_exists(host_util), "deleted file was removed on the host")
+	_check(converged, "host converged to the renamed file and the deletion")
+	# The client's own copy must remain the renamed one.
+	_check(FileAccess.file_exists(client_root.path_join("mat_new.tres")), "client kept the renamed file")
+	_check(not FileAccess.file_exists(client_root.path_join("mat_old.tres")), "client dropped the old name")
+
+	client_ws.free()
+	host_ws.free()
+	client.stop("cleanup")
+	host.stop("cleanup")
+	client.free()
+	host.free()
+	client_manager.free()
+	host_manager.free()
 
 
 ## Reproduces the reported post-crash bug: a client whose local scene does not

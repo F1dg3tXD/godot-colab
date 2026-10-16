@@ -11,7 +11,7 @@ extends RefCounted
 ## rejected during the handshake instead of being allowed to desync.
 ## v2: scene operations are scene-id aware, and workspace (file/scene) requests
 ## and scene-focus broadcasts were added.
-const PROTOCOL_VERSION: int = 2
+const PROTOCOL_VERSION: int = 3
 
 ## Magic marker placed at the front of every packet so garbage/foreign traffic
 ## is discarded before it reaches the decoder. Declared as a static var because
@@ -102,6 +102,7 @@ enum WorkspaceOp {
 	CREATE_SCENE = 0, ## Create a new (empty) scene file.
 	ADD_FILE = 1, ## Create or overwrite a text file inside the project.
 	LIST_SCENES = 2, ## Ask the host to re-advertise the project's scenes.
+	DELETE_FILE = 3, ## Remove a project file (the second half of a rename).
 }
 
 ## Supported collaboration modes for a session.

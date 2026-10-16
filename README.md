@@ -15,10 +15,12 @@ structured, validated operation protocol.
 
 ## Features
 
-- **Top-toolbar controls** (Host, Join, Copy Code, Request Snapshot, Disconnect)
-  next to the playtest buttons, plus an editor dock with username, connection
-  status, generated invitation code, session-code input, participant list,
-  collaboration mode, project sync status, and error messages.
+- **Top-toolbar controls** (Host, Join, **Paste & Join**, Copy Code, Request
+  Snapshot, Disconnect) next to the playtest buttons, plus an editor dock with
+  username, connection status, generated invitation code, session-code input,
+  participant list, collaboration mode, project sync status, and error messages.
+  **Paste & Join** reads an invitation code straight from the clipboard and joins
+  in one click.
 - Isolated ENet/UDP session (host-authoritative). The add-on never touches the
   editor's global `MultiplayerAPI` peer.
 - Direct IP:port connections and short invitation codes resolved through an
@@ -38,9 +40,12 @@ structured, validated operation protocol.
   texture, `Environment`, …) is synced. File-backed resources travel by `res://`
   path; **embedded (path-less) resources** — e.g. a material created inline, or a
   texture dragged straight from the filesystem — are serialised and rebuilt on
-  the other side. In-place edits to an embedded resource (changing its colour)
-  are detected through the resource's `changed` signal. Executable payloads
-  (scripts, packed scenes) are refused.
+  the other side. This also covers **nested node properties**: in-place edits to
+  an embedded resource (changing a material's colour, a `BoxShape3D`'s size, an
+  `Environment`'s mode) propagate, including sub-resources owned by a node. These
+  are caught by periodically re-serialising embedded resources, because most
+  Godot resource types do **not** emit `changed` for ordinary property edits.
+  Executable payloads (scripts, packed scenes) are refused.
 - **Multi-scene collaboration.** Every open scene is tracked independently, so
   collaborators can work in different scenes at once and the host switching tabs
   never reverts anyone's edits. Changes to a scene the host is not viewing are
@@ -53,7 +58,9 @@ structured, validated operation protocol.
 - **Workspace authoring.** Collaborators can ask the host to create a new scene
   or add a project file — including by dropping a binary asset into the
   Filesystem dock; the host validates it (path/size/extension) and distributes a
-  local copy to every peer.
+  local copy to every peer. File **renames and deletions** are propagated too: a
+  renamed file is delivered to its new path and the old path is removed, so
+  participants do not end up with duplicate or stale files.
 - **Ctrl+S just works.** In a host-workspace session, pressing Ctrl+S is promoted
   to a full *shared* save: the host persists every scene that received remote
   edits and notifies all peers. A client's Ctrl+S is forwarded to the host. This
@@ -90,8 +97,9 @@ peers, and UPnP mapping.
 
 1. In editor **A**: open the dock, set a username, click **Host** in the top
    toolbar. Copy the invitation code from the dock (**Copy Code** in the toolbar).
-2. In editor **B**: set a username, paste the code into the dock's session-code
-   field, click **Join** in the top toolbar.
+2. In editor **B**: set a username, then click **Paste & Join** in the top
+   toolbar (or paste the code into the dock's session-code field and click
+   **Join**). The dock reports "Waiting for host approval" if approval is on.
 3. Both docks now list two participants with host/client roles. (Host approval is
    off by default for easy LAN use; enable *Require host approval* in the dock on
    untrusted networks, and the host will then confirm each join.)

@@ -201,6 +201,9 @@ func _on_workspace_message(from_peer: int, type: int, payload: Dictionary) -> vo
 			# Only the host may distribute file content to a client.
 			if not _coordinator.is_host() and from_peer == CollabSessionCoordinator.HOST_PEER_ID:
 				_apply_incoming_file(payload)
+		CollabProtocol.MessageType.FILE_REMOVE:
+			if not _coordinator.is_host() and from_peer == CollabSessionCoordinator.HOST_PEER_ID:
+				_apply_incoming_remove(payload)
 		CollabProtocol.MessageType.SCENE_LIST:
 			if not _coordinator.is_host():
 				var scenes: Variant = payload.get("scenes", [])
@@ -233,6 +236,8 @@ func _host_handle_request(from_peer: int, payload: Dictionary) -> void:
 			else:
 				bytes = str(payload.get("text", "")).to_utf8_buffer()
 			_host_add_file(request_id, path, bytes, bool(payload.get("overwrite", true)), from_peer)
+		CollabConstants.WorkspaceOp.DELETE_FILE:
+			_host_delete_file(request_id, path, from_peer)
 		CollabConstants.WorkspaceOp.LIST_SCENES:
 			_send_scene_list_to(from_peer)
 		_:
@@ -313,9 +318,59 @@ func _host_add_file(request_id: int, path: String, bytes: PackedByteArray, overw
 	status.emit("Added file '%s'." % rel)
 
 
+func _host_delete_file(request_id: int, path: String, from_peer: int) -> void:
+	var rel: String = CollabPathGuard.normalize_relative(path)
+	if rel.is_empty():
+		_send_result(from_peer, request_id, false, path, "Invalid file path.")
+		return
+	if not _is_writable_path(rel):
+		_send_result(from_peer, request_id, false, rel, "Extension not allowed.")
+		return
+	var absolute: String = _absolute(rel)
+	if absolute.is_empty() or not CollabPathGuard.no_symlink_escape(_project_root.call(), rel):
+		_send_result(from_peer, request_id, false, rel, "Unsafe path.")
+		return
+	if FileAccess.file_exists(absolute):
+		var err: Error = DirAccess.remove_absolute(absolute)
+		if err != OK and err != ERR_FILE_NOT_FOUND:
+			_send_result(from_peer, request_id, false, rel, "Could not delete the file: %s" % error_string(err))
+			return
+	_watch_baseline.erase(rel)
+	_revision_bump()
+	_broadcast_file_remove(rel)
+	_refresh_filesystem(rel)
+	_send_result(from_peer, request_id, true, rel, "File removed.")
+	status.emit("Removed file '%s'." % rel)
+
+
 # ---------------------------------------------------------------------------
 # Applying file content on non-host peers (and the host's own create path)
 # ---------------------------------------------------------------------------
+
+## Deletes a project file that the host has removed (rename source or delete).
+## Only files inside the approved workspace and with allowed extensions are
+## touched; an open scene's file is never deleted underneath the editor.
+func _apply_incoming_remove(payload: Dictionary) -> void:
+	var rel: String = CollabPathGuard.normalize_relative(str(payload.get("path", "")))
+	if rel.is_empty() or not _is_writable_path(rel):
+		error_raised.emit("Refused unsafe file removal from host: %s" % str(payload.get("path", "")))
+		return
+	if _is_protected_scene(rel):
+		return
+	var root: String = str(_project_root.call())
+	var absolute: String = CollabPathGuard.resolve_within(root, rel)
+	if absolute.is_empty():
+		error_raised.emit("Refused file removal that would escape the workspace: %s" % rel)
+		return
+	if FileAccess.file_exists(absolute):
+		var err: Error = DirAccess.remove_absolute(absolute)
+		if err != OK and err != ERR_FILE_NOT_FOUND:
+			error_raised.emit("Could not remove '%s': %s" % [rel, error_string(err)])
+			return
+	_watch_baseline.erase(rel)
+	_refresh_filesystem(rel)
+	status.emit("Removed file '%s' from host." % rel)
+
 
 func _apply_incoming_file(payload: Dictionary) -> void:
 	var rel: String = CollabPathGuard.normalize_relative(str(payload.get("path", "")))
@@ -440,10 +495,11 @@ func _scan_and_sync() -> void:
 		return
 	var current: Dictionary = {}
 	_walk_files(root, "", current)
-	# Removed files simply leave the baseline; we do not delete remotely.
-	for rel in _watch_baseline.keys():
-		if not current.has(rel):
-			_watch_baseline.erase(rel)
+	# Additions/changes are relayed first so that when a file is renamed the new
+	# name exists on every peer before the old name is removed. This keeps a
+	# path-backed resource reference (sent by the operation stream) resolvable
+	# throughout the rename instead of dangling.
+	var seen: Dictionary = {}
 	for rel in current.keys():
 		var info: Dictionary = current[rel]
 		var previous: Variant = _watch_baseline.get(rel)
@@ -460,6 +516,16 @@ func _scan_and_sync() -> void:
 		_watch_baseline[rel] = info
 		if digest != str(prev.get("sha", "")):
 			_relay_local_change(rel, root)
+	# Removals: a file that was tracked but is now gone is either the source half
+	# of a rename (handled as add + delete) or a genuine delete. Relay a delete so
+	# the host does not keep a stale copy alongside the new file.
+	for rel in _watch_baseline.keys():
+		if not current.has(rel):
+			seen[rel] = true
+	for rel in seen.keys():
+		_watch_baseline.erase(rel)
+		if _watch_primed:
+			_relay_local_removal(rel)
 	_watch_primed = true
 
 
@@ -493,6 +559,25 @@ func _relay_local_change(rel: String, root: String) -> void:
 			"data": bytes,
 		})
 		status.emit("Synced '%s' to the host." % rel)
+
+
+func _relay_local_removal(rel: String) -> void:
+	if not _is_filesync_path(rel):
+		return
+	if _is_protected_scene(rel):
+		# An open scene is owned by the operation stream; never delete its file.
+		return
+	if not _can_request():
+		return
+	if _coordinator.is_host():
+		_host_delete_file(_next_request_id(), rel, _coordinator.local_peer_id())
+	else:
+		_coordinator.send_workspace(CollabProtocol.MessageType.WORKSPACE_REQUEST, {
+			"request_id": _next_request_id(),
+			"kind": CollabConstants.WorkspaceOp.DELETE_FILE,
+			"path": rel,
+		})
+		status.emit("Requested deletion of '%s' on the host." % rel)
 
 
 ## Walks the project, collecting watched source files as rel -> {size, mtime, sha}.
@@ -584,6 +669,9 @@ func _refresh_baseline_entry(rel: String) -> void:
 		return
 	var absolute: String = CollabPathGuard.resolve_within(root, rel)
 	if absolute.is_empty() or not FileAccess.file_exists(absolute):
+		# The file is gone (applied removal or rename source). Erase the baseline
+		# entry so the next scan does not replay the removal back at the host.
+		_watch_baseline.erase(rel)
 		return
 	var info: Dictionary = _file_stat(absolute)
 	info["sha"] = CollabIdentity.sha256_file(absolute)
@@ -639,6 +727,14 @@ func _broadcast_file_apply(rel: String, bytes: PackedByteArray, is_scene: bool) 
 		"path": rel,
 		"data": bytes,
 		"scene": is_scene,
+	})
+
+
+func _broadcast_file_remove(rel: String) -> void:
+	if not _coordinator.is_host():
+		return
+	_coordinator.send_workspace(CollabProtocol.MessageType.FILE_REMOVE, {
+		"path": rel,
 	})
 
 
