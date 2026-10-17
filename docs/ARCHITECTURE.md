@@ -31,7 +31,9 @@ someone maintaining the add-on, not at end users.
 | `CollabLog` | `core/collab_log.gd` | Leveled logging. |
 | `CollabIdentity` | `core/identity.gd` | Engine version and project identity hashing. |
 | `CollabProtocol` | `network/protocol.gd` | Framing (magic + version + type + length), encode/decode, per-type validation. |
-| `CollabSessionManager` | `network/session_manager.gd` | Owns the `ENetMultiplayerPeer`, poll loop, reliable/unreliable send, peer tracking. |
+| `CollabRelayProtocol` | `network/relay_protocol.gd` | Relay-level framing (`GCRL`), kinds (register/registered/data/member-join/leave/error/kick), and origin/destination wrapping. |
+| `CollabRelayServer` | `network/relay_server.gd` | Headless room-based ENet relay: assigns app ids, rewrites origins, broadcasts membership. Used by `tools/relay_server/`. |
+| `CollabSessionManager` | `network/session_manager.gd` | Owns the `ENetMultiplayerPeer`, poll loop, reliable/unreliable send, peer tracking. Also speaks the relay (host *and* client connect outbound; application ids abstract away transport ids). |
 | `CollabSessionCoordinator` | `session/session_coordinator.gd` | Handshake, approval, participant registry, cursor relay, routing of scene/save/transfer messages. |
 | `CollabParticipant` / `CollabParticipantRegistry` | `network/participant.gd`, `network/participant_registry.gd` | Participant records and authoritative list. |
 | `CollabPresenceService` | `presence/presence_service.gd` | Samples the local camera ray, sends/relays cursor updates, stores remote cursor state, draws overlays. |
@@ -415,6 +417,51 @@ imported or executed by the add-on.
   controlled by editor settings (`cursors/show_3d_markers`, `cursors/show_labels`,
   `cursors/marker_3d_scale`; depth via `cursors/marker_depth`).
 
+## Connectivity paths
+
+The add-on supports three ways to reach a session, all over ENet/UDP:
+
+1. **Direct** — the client connects straight to the host's `ip:port`
+   (`CollabInviteCode.encode_direct`, `gc1.…`). Works on LAN and loopback; over
+   the internet it needs a reachable host port (UPnP or manual forwarding).
+2. **Rendezvous short code** — a 6-character code registered with
+   `tools/rendezvous_server/` resolves to a direct endpoint. The rendezvous is a
+   lookup service, not a relay; the data path is still direct.
+3. **Relay** — both sides connect outbound to a dedicated relay
+   (`tools/relay_server/`). This works behind NAT/CGNAT with no port forwarding.
+
+### Relay path
+
+`CollabRelayServer` is a headless Godot `SceneTree` script (`tools/relay_server/
+relay_server.gd`) driving a room-based ENet server. Participants register with a
+room code and a token; the first host to register owns the room. The relay:
+
+- assigns the host application id `1` and clients `2, 3, …`, so the coordinator's
+  `HOST_PEER_ID` assumption holds unchanged;
+- rewrites each forwarded packet's origin to the sender's application id, so a
+  peer cannot spoof another peer's identity;
+- emits membership events so `CollabSessionManager` can surface them as the same
+  `peer_connected` / `peer_disconnected` signals used in direct mode;
+- never parses application payloads and stores nothing on disk.
+
+`CollabRelayProtocol` frames relay traffic with a 10-byte `GCRL` header
+(`REGISTER`, `REGISTERED`, `DATA`, `MEMBER_JOIN`, `MEMBER_LEAVE`, `ERROR`,
+`KICK`). `DATA` carries a `u32 origin` and `u32 destination` before the wrapped
+`CollabProtocol` bytes, because every peer is otherwise connected only to the
+relay. `CollabSessionManager` translates between these and its usual send/receive
+API:
+
+- `broadcast()` (host) sends a `DATA` envelope with the broadcast destination;
+  `send_to(peer)` addresses an application id;
+- `send_to_server()` always addresses application id `1`;
+- a host emits `session_started` the moment it calls `host_via_relay`, *before*
+  `REGISTERED` arrives, so outbound packets are queued in an outbox and flushed on
+  registration (otherwise the initial scene-list broadcast would be dropped).
+
+The relay is intentionally swappable: because the session/transport interface is
+unchanged, a future relay implementation (or a WebSocket relay) can be added
+without touching the dock or coordinator.
+
 ## Workspace modes
 
 - **Host-workspace** (`HOST_WORKSPACE`): the host owns the authoritative scene
@@ -428,10 +475,10 @@ imported or executed by the add-on.
 
 Preferences are stored under `godot_collab/*` in the editor's `EditorSettings`
 (see `core/collab_settings.gd`): username, default port, max peers, rendezvous
-URL, direct advertise host, UPnP toggle, cursor label/size/depth, auto-save +
-delay, download directory, per-file/total transfer limits, join approval,
-invite-token requirement, workspace authoring, and source-file sync. Session
-tokens are never written to committed project files.
+URL, relay toggle/address/port, direct advertise host, UPnP toggle, cursor
+label/size/depth, auto-save + delay, download directory, per-file/total transfer
+limits, join approval, invite-token requirement, workspace authoring, and
+source-file sync. Session tokens are never written to committed project files.
 
 Two defaults favour zero-configuration LAN use: the rendezvous URL default is
 empty (`DEFAULT_RENDEZVOUS_URL = ""`, so short codes are unavailable until a

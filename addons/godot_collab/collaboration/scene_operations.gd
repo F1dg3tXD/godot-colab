@@ -83,6 +83,15 @@ const VALUE_RESOURCE: String = "resource_path"
 ## texture is dropped onto a mesh) serialised to text. Sent because it has no
 ## `res://` path the receiver could load independently.
 const VALUE_RESOURCE_INLINE: String = "resource_inline"
+## A file-backed resource sent with both its `res://` path and its serialised
+## content. The path lets a receiver that already has the file keep its shared,
+## cached instance (so references stay intact) while the content captures
+## in-memory property edits that were never saved to disk.
+const VALUE_RESOURCE_CONTENT: String = "resource_content"
+## Containers that hold resources (which the plain array/dictionary kinds cannot
+## represent) are sent as recursively encoded element lists.
+const VALUE_ARRAY_ENCODED: String = "array_encoded"
+const VALUE_DICTIONARY_ENCODED: String = "dictionary_encoded"
 const VALUE_UNSUPPORTED: String = "unsupported"
 
 const MAX_STRING_VALUE: int = 8192
@@ -239,18 +248,24 @@ static func encode_value(value: Variant) -> Dictionary:
 					return {"kind": VALUE_NULL, "value": null}
 				return _unsupported()
 			if not resource.resource_path.is_empty():
-				# File-backed resource: send the path, the receiver loads its copy.
+				# File-backed resource: send the path so a receiver that has the
+				# file can reuse its shared instance, plus the serialised content
+				# so in-memory edits that were never saved still propagate. Big or
+				# unbounded resources fall back to the path alone.
+				var content: Dictionary = _encode_resource_content(resource)
+				if not content.is_empty():
+					return content
 				return {"kind": VALUE_RESOURCE, "value": resource.resource_path}
 			# Embedded resource: serialise it so the receiver can rebuild it.
 			return _encode_inline_resource(resource)
 		TYPE_ARRAY:
-			if not _is_plain_container(value, 0):
-				return _unsupported()
-			return {"kind": VALUE_ARRAY, "value": value}
+			if _is_plain_container(value, 0):
+				return {"kind": VALUE_ARRAY, "value": value}
+			return _encode_container(value, TYPE_ARRAY)
 		TYPE_DICTIONARY:
-			if not _is_plain_container(value, 0):
-				return _unsupported()
-			return {"kind": VALUE_DICTIONARY, "value": value}
+			if _is_plain_container(value, 0):
+				return {"kind": VALUE_DICTIONARY, "value": value}
+			return _encode_container(value, TYPE_DICTIONARY)
 		TYPE_PACKED_INT32_ARRAY:
 			return _packed(value, VALUE_PACKED_INT32)
 		TYPE_PACKED_INT64_ARRAY:
@@ -278,7 +293,32 @@ static func is_encodable(value: Variant) -> bool:
 ## True when [param kind] represents a resource reference that could fail to
 ## resolve locally (missing file or refused inline payload).
 static func is_resource_kind(kind: String) -> bool:
-	return kind == VALUE_RESOURCE or kind == VALUE_RESOURCE_INLINE
+	return kind == VALUE_RESOURCE or kind == VALUE_RESOURCE_INLINE or kind == VALUE_RESOURCE_CONTENT
+
+
+## True when [param value] cannot be compared cheaply and must be periodically
+## re-serialised to catch in-place edits. Covers resources (which most Godot
+## types never announce changes for) and containers that hold resources.
+static func requires_deep_scan(value: Variant) -> bool:
+	if typeof(value) == TYPE_OBJECT:
+		return value is Resource
+	if typeof(value) == TYPE_ARRAY or typeof(value) == TYPE_DICTIONARY:
+		return not _is_plain_container(value, 0)
+	return false
+
+
+## Full-content fingerprint of [param value] used by the deep resource scan. Two
+## values with the same fingerprint encode identically. Empty string means the
+## value cannot be synchronised at all.
+static func deep_signature(value: Variant) -> String:
+	var encoded: Dictionary = encode_value(value)
+	var kind: String = str(encoded.get("kind", ""))
+	if kind == VALUE_UNSUPPORTED:
+		return ""
+	var payload: Variant = encoded.get("value", null)
+	if typeof(payload) == TYPE_STRING:
+		return payload
+	return "%s|%s" % [kind, str(payload)]
 
 
 ## Comparison-only projection of a value used by the diff watcher's baseline.
@@ -307,6 +347,66 @@ static func _encode_inline_resource(resource: Resource) -> Dictionary:
 	if text.is_empty():
 		return _unsupported()
 	return {"kind": VALUE_RESOURCE_INLINE, "value": text}
+
+
+## Serialises a file-backed resource together with its path. Returns an empty
+## dictionary when the content cannot (safely, or within the size bound) be
+## serialised, in which case the caller falls back to the path alone.
+static func _encode_resource_content(resource: Resource) -> Dictionary:
+	var path: String = resource.resource_path
+	if path.is_empty():
+		return {}
+	var text: String = _resource_to_text(resource)
+	if text.is_empty():
+		return {}
+	return {"kind": VALUE_RESOURCE_CONTENT, "value": {"path": path, "text": text}}
+
+
+## Recursively encodes an array/dictionary that contains resources the plain
+## kinds cannot represent (objects would be dropped by the variant encoder).
+## Returns unsupported if any element is itself unsupported.
+static func _encode_container(value: Variant, container_type: int) -> Dictionary:
+	if _container_depth_exceeded(value, 0):
+		return _unsupported()
+	if container_type == TYPE_ARRAY:
+		var arr: Array = value
+		if arr.size() > MAX_CONTAINER_ELEMENTS:
+			return _unsupported()
+		var items: Array = []
+		for item in arr:
+			var encoded: Dictionary = encode_value(item)
+			if encoded["kind"] == VALUE_UNSUPPORTED:
+				return _unsupported()
+			items.append(encoded)
+		return {"kind": VALUE_ARRAY_ENCODED, "value": {"items": items}}
+	var dict: Dictionary = value
+	if dict.size() > MAX_CONTAINER_ELEMENTS:
+		return _unsupported()
+	var entries: Array = []
+	for key in dict.keys():
+		var encoded_key: Dictionary = encode_value(key)
+		var encoded_value: Dictionary = encode_value(dict[key])
+		if encoded_key["kind"] == VALUE_UNSUPPORTED or encoded_value["kind"] == VALUE_UNSUPPORTED:
+			return _unsupported()
+		entries.append([encoded_key, encoded_value])
+	return {"kind": VALUE_DICTIONARY_ENCODED, "value": {"entries": entries}}
+
+
+static func _container_depth_exceeded(value: Variant, depth: int) -> bool:
+	if depth > MAX_CONTAINER_DEPTH:
+		return true
+	match typeof(value):
+		TYPE_ARRAY:
+			for item in (value as Array):
+				if _container_depth_exceeded(item, depth + 1):
+					return true
+		TYPE_DICTIONARY:
+			for key in (value as Dictionary).keys():
+				if _container_depth_exceeded(key, depth + 1):
+					return true
+				if _container_depth_exceeded((value as Dictionary)[key], depth + 1):
+					return true
+	return false
 
 
 static func _resource_to_text(resource: Resource) -> String:
@@ -436,12 +536,83 @@ static func decode_value(kind: String, value: Variant, fallback: Variant = null)
 		VALUE_RESOURCE_INLINE:
 			var loaded: Resource = _load_inline_resource(str(value))
 			return loaded if loaded != null else fallback
+		VALUE_RESOURCE_CONTENT:
+			if typeof(value) != TYPE_DICTIONARY:
+				return fallback
+			var loaded_content: Resource = _load_inline_resource(str((value as Dictionary).get("text", "")))
+			return loaded_content if loaded_content != null else fallback
+		VALUE_ARRAY_ENCODED:
+			return _decode_container(value, true, fallback)
+		VALUE_DICTIONARY_ENCODED:
+			return _decode_container(value, false, fallback)
 		_:
 			return fallback
 
 
+## Applies serialised resource content onto the best local instance. When an
+## equivalent (same path, same class) instance already exists, its properties are
+## merged in place so every reference to that resource stays intact; otherwise a
+## fresh instance is rebuilt. Returns null when the text cannot be loaded.
+static func apply_resource_content(path: String, text: String, existing: Resource) -> Resource:
+	var incoming: Resource = _load_inline_resource(text)
+	if incoming == null:
+		return null
+	if existing != null and not path.is_empty() and existing.resource_path == path and existing.get_class() == incoming.get_class():
+		_merge_resource(existing, incoming)
+		return existing
+	if not path.is_empty() and ResourceLoader.exists(path):
+		var cached: Resource = ResourceLoader.load(path)
+		if cached != null and cached.get_class() == incoming.get_class():
+			_merge_resource(cached, incoming)
+			return cached
+	return incoming
+
+
+## Copies serialisable properties from [param source] onto [param target],
+## leaving the target's identity and path untouched.
+static func _merge_resource(target: Resource, source: Resource) -> void:
+	for info in source.get_property_list():
+		var prop: String = str(info.get("name", ""))
+		if prop == "resource_path" or prop == "resource_local_to_scene":
+			continue
+		var usage: int = int(info.get("usage", 0))
+		if (usage & PROPERTY_USAGE_STORAGE) == 0 and (usage & PROPERTY_USAGE_EDITOR) == 0:
+			continue
+		target.set(prop, source.get(prop))
+	target.emit_changed()
+
+
 static func _unsupported() -> Dictionary:
 	return {"kind": VALUE_UNSUPPORTED, "value": null}
+
+
+## Rebuilds an array/dictionary from a recursively encoded container payload.
+static func _decode_container(value: Variant, is_array: bool, fallback: Variant) -> Variant:
+	if typeof(value) != TYPE_DICTIONARY:
+		return fallback
+	var payload: Dictionary = value
+	if is_array:
+		var out: Array = []
+		var items: Variant = payload.get("items", [])
+		if typeof(items) != TYPE_ARRAY:
+			return fallback
+		for item in (items as Array):
+			if typeof(item) != TYPE_DICTIONARY:
+				return fallback
+			out.append(decode_value(str((item as Dictionary).get("kind", "")), (item as Dictionary).get("value")))
+		return out
+	var entries: Variant = payload.get("entries", [])
+	if typeof(entries) != TYPE_ARRAY:
+		return fallback
+	var dict: Dictionary = {}
+	for entry in (entries as Array):
+		if typeof(entry) != TYPE_ARRAY or (entry as Array).size() != 2:
+			return fallback
+		var encoded_key: Dictionary = (entry as Array)[0]
+		var encoded_value: Dictionary = (entry as Array)[1]
+		var key: Variant = decode_value(str(encoded_key.get("kind", "")), encoded_key.get("value"))
+		dict[key] = decode_value(str(encoded_value.get("kind", "")), encoded_value.get("value"))
+	return dict
 
 
 static func _packed(value: Variant, kind: String) -> Dictionary:

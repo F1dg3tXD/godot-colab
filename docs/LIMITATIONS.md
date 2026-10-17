@@ -21,8 +21,10 @@ are listed explicitly so nothing here is mistaken for working functionality.
   **in-place edit of that embedded material**, and an **in-place edit of a nested
   `BoxShape3D` sub-resource** on a `CollisionShape3D`), a **workspace
   rename/delete** loopback flow, a **rejoin-desync** flow (stale client scene +
-  reconnect), and a **multi-scene isolation** flow (host focused on scene B while
-  a client edits scene A). It passes (see [`TESTING.md`](TESTING.md)).
+  reconnect), a **multi-scene isolation** flow (host focused on scene B while
+  a client edits scene A), and a **relay** flow (a `CollabRelayServer` plus a
+  relay host and relay client in one process: registration, HELLO routing, cursor
+  relay, token rejection, host departure). It passes (see [`TESTING.md`](TESTING.md)).
 - The interactive editor behaviours (dock UI, top-toolbar buttons, remote cursor
   drawing, `_forward_3d_gui_input` / `_forward_3d_draw_over_viewport`, scene
   editing, **Ctrl+S shared save**, project download, approval prompts) require
@@ -36,18 +38,24 @@ are listed explicitly so nothing here is mistaken for working functionality.
 
 - **No encryption.** ENet over UDP is not encrypted and the invite token is a
   shared bearer secret, not an authenticated identity. Do not treat a session as
-  confidential or as strong authentication.
-- **No relay.** If direct connectivity fails (CGNAT, symmetric NAT, restrictive
-  firewalls, UPnP-unsupported routers), the session will not connect. The
-  transport interfaces are designed so a relay could be added later, but none is
-  built in.
+  confidential or as strong authentication. This applies to the relay path too.
+- **Relay support is present but only loopback-tested.** `tools/relay_server/`
+  forwards traffic between a host and its clients so sessions work behind NAT /
+  CGNAT / restrictive firewalls with no port forwarding, and the relay path is
+  covered by in-process loopback tests (registration, HELLO routing, cursor
+  relay, token rejection, host departure). It has **not** been exercised across a
+  real internet relay or a real NAT. Direct connectivity is still the default;
+  relay mode is opt-in in the dock.
+- **After a relay or direct connection is established, there is no relay
+  fallback.** If the relay process stops or the host leaves, clients are
+  disconnected; there is no automatic reconnection or migration.
 - **UPnP is best-effort** and may silently fail on many routers. Failures are
   reported in the dock; manual port forwarding is the fallback.
 - The rendezvous service maps short codes to endpoints; it is **not** an ENet
   relay and does not carry session traffic. Its default configuration is plain
   HTTP on localhost.
-- Short code lookup and direct connection have only been exercised in local and
-  loopback-style testing, not across real NATs between two networks.
+- Short code lookup, direct connection and the relay have only been exercised in
+  local and loopback-style testing, not across real NATs between two networks.
 
 ## Scene collaboration
 

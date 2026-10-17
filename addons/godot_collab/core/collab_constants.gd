@@ -33,6 +33,9 @@ const MAX_TRANSFER_CHUNK: int = 512 * 1024 # 512 KiB
 ## Default UDP port used when hosting.
 const DEFAULT_PORT: int = 45899
 
+## Default UDP port used by the dedicated relay server.
+const DEFAULT_RELAY_PORT: int = 45900
+
 ## Default maximum number of simultaneous remote peers.
 const DEFAULT_MAX_PEERS: int = 8
 
@@ -125,5 +128,5 @@ enum ConnectivityState {
 	UNKNOWN = 0, ## Not verified yet.
 	LAN_ONLY = 1, ## Reachable only inside the local network.
 	DIRECT = 2, ## Externally reachable (UPnP mapped / manual forward).
-	RELAY = 3, ## Reserved for a future relay path.
+	RELAY = 3, ## Reached through a dedicated relay server (works behind NAT).
 }

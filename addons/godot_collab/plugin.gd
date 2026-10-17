@@ -259,7 +259,7 @@ func _set_invite(invite: String) -> void:
 		_toolbar.set_invite_available(not invite.strip_edges().is_empty())
 
 
-func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: bool) -> void:
+func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: bool, use_relay: bool) -> void:
 	if _coordinator.session_manager.is_active():
 		_dock.push_message("Already in a session. Disconnect first.", true)
 		return
@@ -270,6 +270,9 @@ func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: 
 	_coordinator.approve_joins = _settings.get_bool(CollabSettings.KEY_APPROVE_JOINS, false)
 	_coordinator.require_token = _settings.get_bool(CollabSettings.KEY_REQUIRE_TOKEN, true)
 	var max_peers: int = clampi(_settings.get_int(CollabSettings.KEY_MAX_PEERS, CollabConstants.DEFAULT_MAX_PEERS), 1, 64)
+	if use_relay:
+		_host_via_relay(mode, max_peers)
+		return
 	var err: Error = _coordinator.start_host(port, max_peers, mode, _coordinator.approve_joins)
 	if err != OK:
 		_dock.push_message("Failed to host: %s" % error_string(err), true)
@@ -285,6 +288,55 @@ func _on_host_requested(username: String, port: int, mode: int, use_rendezvous: 
 			_dock.push_message("UPnP failed: %s. Use manual port forwarding or LAN." % str(result.get("error", "")), true)
 	_establish_invite(use_rendezvous, port, mode)
 	_update_connectivity()
+
+
+## Hosts through a dedicated relay server. Generates a short room code and a
+## random session token, then advertises a `gc2.` invitation that embeds both the
+## relay endpoint and the room so clients can reach the host with no port
+## forwarding on either side.
+func _host_via_relay(mode: int, max_peers: int) -> void:
+	var endpoint: Dictionary = _parse_relay_address(_settings.get_string(CollabSettings.KEY_RELAY_ADDRESS, ""), _settings.get_int(CollabSettings.KEY_RELAY_PORT, CollabConstants.DEFAULT_RELAY_PORT))
+	if endpoint.is_empty():
+		_dock.push_message("Invalid relay address. Enter a host or host:port.", true)
+		return
+	var room: String = CollabInviteCode.generate_short_code()
+	var token: String = _random_token()
+	var err: Error = _coordinator.start_host_via_relay(str(endpoint["host"]), int(endpoint["port"]), room, token, max_peers, mode, _coordinator.approve_joins)
+	if err != OK:
+		_dock.push_message("Failed to start relay session: %s" % error_string(err), true)
+		return
+	_upnp_attempted = false
+	_upnp_external = ""
+	var invite: String = CollabInviteCode.encode_relay(str(endpoint["host"]), int(endpoint["port"]), room, token, _project_id(), mode)
+	_set_invite(invite)
+	_dock.set_connectivity(CollabConstants.ConnectivityState.RELAY, "relay %s:%d, room %s" % [str(endpoint["host"]), int(endpoint["port"]), room])
+	_dock.push_message("Hosting via relay %s:%d (room %s). Share the invitation code." % [str(endpoint["host"]), int(endpoint["port"]), room], false)
+
+
+## Parses "host", "host:port" or "udp://host:port" into {host, port}, or {} on error.
+func _parse_relay_address(text: String, default_port: int) -> Dictionary:
+	var value: String = text.strip_edges()
+	if value.begins_with("udp://"):
+		value = value.substr("udp://".length())
+	value = value.trim_suffix("/")
+	if value.is_empty():
+		return {}
+	var host: String = value
+	var port: int = default_port
+	if value.count(":") == 1:
+		var parts: PackedStringArray = value.split(":")
+		host = parts[0].strip_edges()
+		if not parts[1].is_valid_int():
+			return {}
+		port = int(parts[1])
+	if host.is_empty() or port <= 0 or port > 65535:
+		return {}
+	return {"host": host, "port": port}
+
+
+func _random_token() -> String:
+	var crypto := Crypto.new()
+	return Marshalls.raw_to_base64(crypto.generate_random_bytes(18)).replace("+", "").replace("/", "").replace("=", "")
 
 
 func _establish_invite(use_rendezvous: bool, port: int, mode: int) -> void:
@@ -342,8 +394,27 @@ func _on_join_requested(invite: String) -> void:
 	var host: String = str(parsed.get("host", ""))
 	var port: int = int(parsed.get("port", 0))
 	var token: String = str(parsed.get("token", ""))
-	_coordinator.require_token = not token.is_empty()
+	_coordinator.require_token = not token.is_empty() or kind == "relay"
+	if kind == "relay":
+		_join_relay(host, port, str(parsed.get("room", "")), token, int(parsed.get("mode", CollabConstants.WorkspaceMode.HOST_WORKSPACE)))
+		return
 	_join_endpoint(host, port, token, int(parsed.get("mode", CollabConstants.WorkspaceMode.HOST_WORKSPACE)))
+
+
+## Joins a session through a relay server using the endpoint and room embedded in
+## a `gc2.` invitation.
+func _join_relay(host: String, port: int, room: String, token: String, mode: int) -> void:
+	if host.is_empty() or port <= 0 or room.is_empty():
+		_dock.push_message("Invalid relay invitation (missing endpoint or room).", true)
+		return
+	_coordinator.workspace_mode = mode
+	_dock.set_connection_status(CollabConstants.ConnectionState.CONNECTING, "Joining relay room %s" % room)
+	_dock.set_connectivity(CollabConstants.ConnectivityState.RELAY, "relay %s:%d, room %s" % [host, port, room])
+	_dock.push_message("Joining relay room %s via %s:%d..." % [room, host, port], false)
+	var err: Error = _coordinator.join_via_relay(host, port, room, token, mode)
+	if err != OK:
+		_dock.set_connection_status(CollabConstants.ConnectionState.DISCONNECTED, "Not connected")
+		_dock.push_message("Failed to reach relay %s:%d: %s" % [host, port, error_string(err)], true)
 
 
 func _on_rendezvous_lookup(code: String, ok: bool, data: Dictionary, error: String) -> void:

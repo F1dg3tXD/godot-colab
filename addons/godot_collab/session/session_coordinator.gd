@@ -72,6 +72,12 @@ var approve_joins: bool = true
 var revision: int = 0
 var host_port: int = 0
 
+## Relay state (populated when the session runs through a dedicated relay).
+var relay_enabled: bool = false
+var relay_address: String = ""
+var relay_port: int = 0
+var relay_room: String = ""
+
 var get_project_id: Callable = Callable()
 var get_scene_id: Callable = Callable()
 var get_username: Callable = Callable()
@@ -96,6 +102,7 @@ func setup(manager: CollabSessionManager, logs: CollabLog) -> void:
 	session_manager.peer_connected.connect(_on_peer_connected)
 	session_manager.peer_disconnected.connect(_on_peer_disconnected)
 	session_manager.connection_failed.connect(_on_connection_failed)
+	session_manager.host_disconnected.connect(_on_transport_lost)
 
 
 func is_host() -> bool:
@@ -142,6 +149,54 @@ func join(address: String, port: int, token: String = "") -> Error:
 	return OK
 
 
+## Hosts a session through a dedicated relay. [param room] is a short,
+## human-shareable code; [param token] authenticates joining clients. The relay
+## forwards traffic so neither side needs an inbound-reachable port.
+func start_host_via_relay(relay_host: String, relay_port_arg: int, room: String, token: String, max_peers: int, mode: int, p_approve_joins: bool) -> Error:
+	workspace_mode = mode
+	approve_joins = p_approve_joins
+	host_port = relay_port_arg
+	session_id = _random_hex(16)
+	session_token = token
+	relay_enabled = true
+	relay_address = relay_host
+	relay_port = relay_port_arg
+	relay_room = room
+	var err: Error = session_manager.host_via_relay(relay_host, relay_port_arg, room, token, max_peers)
+	if err != OK:
+		relay_enabled = false
+		return err
+	_is_host = true
+	_local_peer_id = session_manager.local_peer_id()
+	registry.set_local(_local_peer_id, true)
+	var host := CollabParticipant.make(_local_peer_id, _username(), true, true)
+	host.project_id = _project_id()
+	host.scene_id = _scene_id()
+	host.capabilities = capabilities
+	registry.upsert(host)
+	registry.changed.emit()
+	session_started.emit(true)
+	_notice("Hosting relay room %s via %s:%d." % [room, relay_host, relay_port_arg])
+	return OK
+
+
+## Joins a relay-hosted session. Reaches the host through the relay, so it works
+## behind NAT/CGNAT without port forwarding.
+func join_via_relay(relay_host: String, relay_port_arg: int, room: String, token: String, mode: int) -> Error:
+	workspace_mode = mode
+	session_token = token
+	relay_enabled = true
+	relay_address = relay_host
+	relay_port = relay_port_arg
+	relay_room = room
+	var err: Error = session_manager.join_via_relay(relay_host, relay_port_arg, room, token)
+	if err != OK:
+		relay_enabled = false
+		return err
+	_is_host = false
+	return OK
+
+
 func stop(reason: String = "disconnected") -> void:
 	if session_manager != null and _is_host and session_manager.is_active():
 		session_manager.broadcast(CollabProtocol.MessageType.PARTICIPANT_LEAVE, {"peer_id": _local_peer_id})
@@ -151,6 +206,10 @@ func stop(reason: String = "disconnected") -> void:
 	registry.clear()
 	_is_host = false
 	_local_peer_id = 0
+	relay_enabled = false
+	relay_address = ""
+	relay_port = 0
+	relay_room = ""
 	session_stopped.emit(reason)
 
 
@@ -446,6 +505,20 @@ func _on_peer_disconnected(peer_id: int) -> void:
 func _on_connection_failed(reason: String) -> void:
 	error_raised.emit("Connection failed: %s" % reason)
 	session_stopped.emit("Connection failed: %s" % reason)
+
+
+## Fired when the transport to the session is lost at a level below the peer
+## protocol (currently: the connection to a relay server dropped). Treated as a
+## terminal session failure for both roles.
+func _on_transport_lost() -> void:
+	_pending.clear()
+	_admitted.clear()
+	registry.clear()
+	_is_host = false
+	_local_peer_id = 0
+	relay_enabled = false
+	session_manager.close()
+	session_stopped.emit("Lost connection to the relay server.")
 
 
 # ---------------------------------------------------------------------------

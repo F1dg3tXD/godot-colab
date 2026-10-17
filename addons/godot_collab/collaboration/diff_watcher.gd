@@ -36,12 +36,13 @@ var _root: Node = null
 var _suspended: bool = false
 var _over_budget_warned: bool = false
 var _root_id: int = -1
-## Embedded resources referenced by the current scan, keyed by instance id:
-## { res_id: { resource: Resource, targets: [{node, property}] } }. Rebuilt every
-## scan so in-place edits can be caught by a content comparison (a reference-only
-## signature would miss them).
-var _scan_bindings: Dictionary = {}
-## Last serialised content of each bound embedded resource: res_id -> String.
+## Deep-scanned properties of the current scan, keyed by "<node instance id>|<property>":
+## { key: { node: Node, property: String } }. Rebuilt every scan so in-place
+## resource edits can be caught by a content comparison (a reference-only
+## signature would miss them). Covers embedded resources, file-backed resources
+## and containers that hold resources.
+var _deep_bindings: Dictionary = {}
+## Last full-content fingerprint of each deep-scanned property: key -> String.
 ## Compared on [_deep_scan_resources] to detect in-place edits.
 var _res_sigs: Dictionary = {}
 var _deep_last_ms: int = 0
@@ -105,13 +106,13 @@ func _scan() -> void:
 		_baseline.clear()
 		_capture_baseline(_root)
 		return
-	_scan_bindings = {}
+	_deep_bindings = {}
 	var ops: Array = []
 	var next_baseline: Dictionary = {}
 	for iid in current.keys():
 		var node: Node = current[iid]
 		var entry: Dictionary = _describe(node)
-		_record_bindings(node, entry)
+		_record_bindings(node)
 		if _baseline.has(iid):
 			_compare(_baseline[iid], entry, ops)
 		else:
@@ -251,66 +252,60 @@ func _watched_props(node: Node) -> Dictionary:
 	return CollabSceneOperations.collect_syncable_props(node, true)
 
 
-## Records embedded resources referenced by [param entry] so their "changed"
-## signal can trigger a targeted property operation for in-place edits.
-func _record_bindings(node: Node, entry: Dictionary) -> void:
-	var props: Dictionary = entry.get("props", {})
-	for prop in props.keys():
-		var encoded: Dictionary = props[prop]
-		if str(encoded.get("kind", "")) != CollabSceneOperations.VALUE_RESOURCE_INLINE:
+## Records properties whose value can change without the cheap signature
+## noticing: resources and containers holding resources. Their full content is
+## compared on a slow cadence because most Resource subclasses (materials,
+## environments, meshes) never emit their "changed" signal for ordinary edits.
+func _record_bindings(node: Node) -> void:
+	for info in node.get_property_list():
+		var prop: String = str(info.get("name", ""))
+		if not CollabSceneOperations.is_syncable_property_name(prop):
 			continue
-		var res_id: int = int(encoded.get("value", 0))
-		if res_id == 0:
+		var usage: int = int(info.get("usage", 0))
+		if (usage & PROPERTY_USAGE_INTERNAL) != 0:
 			continue
-		var resource: Resource = node.get(prop) as Resource
-		if resource == null:
+		if (usage & PROPERTY_USAGE_STORAGE) == 0 and (usage & PROPERTY_USAGE_EDITOR) == 0:
 			continue
-		if not _scan_bindings.has(res_id):
-			_scan_bindings[res_id] = {"resource": resource, "targets": []}
-			# Anchor the content signature the moment the resource is first seen.
-			# If this were left to the periodic deep scan, an edit made before that
-			# scan runs would be folded into the baseline and silently lost.
-			if not _res_sigs.has(res_id):
-				var encoded_res: Dictionary = CollabSceneOperations.encode_value(resource)
-				if encoded_res["kind"] == CollabSceneOperations.VALUE_RESOURCE_INLINE:
-					_res_sigs[res_id] = str(encoded_res["value"])
-		(_scan_bindings[res_id]["targets"] as Array).append({"node": node, "property": str(prop)})
+		var value: Variant = node.get(prop)
+		if not CollabSceneOperations.requires_deep_scan(value):
+			continue
+		var key: String = "%d|%s" % [node.get_instance_id(), prop]
+		_deep_bindings[key] = {"node": node, "property": prop}
+		# Anchor the content signature the moment the property is first seen. If
+		# this were left to the periodic deep scan, an edit made before that scan
+		# runs would be folded into the baseline and silently lost.
+		if not _res_sigs.has(key):
+			_res_sigs[key] = CollabSceneOperations.deep_signature(value)
 
 
-## Re-serialises every bound embedded resource and emits property operations for
+## Re-serialises every deep-scanned property and emits property operations for
 ## any whose content changed since the previous pass. This replaces relying on
-## [signal Resource.changed], which most Resource subclasses (materials,
-## environments, meshes) never emit for ordinary property edits. The first pass
-## for a resource only records its signature so it does not re-send on bind.
+## [signal Resource.changed], which most Resource subclasses never emit for
+## ordinary property edits. The first pass for a property only records its
+## signature so it does not re-send on bind.
 func _deep_scan_resources() -> void:
-	if _scan_bindings.is_empty():
+	if _deep_bindings.is_empty():
 		_res_sigs.clear()
 		return
 	var next_sigs: Dictionary = {}
 	var ops: Array = []
-	for res_id in _scan_bindings.keys():
-		var binding: Dictionary = _scan_bindings[res_id]
-		var resource: Resource = binding.get("resource") as Resource
-		if resource == null or not is_instance_valid(resource):
+	for key in _deep_bindings.keys():
+		var binding: Dictionary = _deep_bindings[key]
+		var node: Node = binding.get("node")
+		if not is_instance_valid(node):
 			continue
-		var encoded: Dictionary = CollabSceneOperations.encode_value(resource)
+		var prop: String = str(binding.get("property", ""))
+		var value: Variant = node.get(prop)
+		var signature: String = CollabSceneOperations.deep_signature(value)
+		next_sigs[key] = signature
+		if not _res_sigs.has(key):
+			continue
+		if str(_res_sigs[key]) == signature:
+			continue
+		var encoded: Dictionary = CollabSceneOperations.encode_value(value)
 		if encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
 			continue
-		var signature: String = str(encoded["value"])
-		next_sigs[res_id] = signature
-		if not _res_sigs.has(res_id):
-			continue
-		if str(_res_sigs[res_id]) == signature:
-			continue
-		for target in (binding["targets"] as Array):
-			var node: Node = target.get("node")
-			if not is_instance_valid(node):
-				continue
-			var prop: String = str(target.get("property", ""))
-			var target_encoded: Dictionary = CollabSceneOperations.encode_value(node.get(prop))
-			if target_encoded["kind"] == CollabSceneOperations.VALUE_UNSUPPORTED:
-				continue
-			ops.append(CollabSceneOperations.make_property_op(local_peer_id, _next_op_id(), scene_id, base_revision, _ensure_id(node), prop, target_encoded))
+		ops.append(CollabSceneOperations.make_property_op(local_peer_id, _next_op_id(), scene_id, base_revision, _ensure_id(node), prop, encoded))
 	_res_sigs = next_sigs
 	if not ops.is_empty():
 		operations_detected.emit(ops)
@@ -318,7 +313,7 @@ func _deep_scan_resources() -> void:
 
 func _clear_resource_tracking() -> void:
 	_res_sigs.clear()
-	_scan_bindings.clear()
+	_deep_bindings.clear()
 
 
 func _transform_delta(a: Transform3D, b: Transform3D) -> float:

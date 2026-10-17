@@ -13,11 +13,14 @@ cd /path/to/godot-colab
 - Exit code `0` and a final `RESULT: PASS` mean all checks passed.
 - Exit code `1` with `RESULT: FAIL` means at least one check failed; each failure
   is printed individually.
-- The suite (currently **216 checks**) covers: protocol framing/validation (bad
+- The suite (currently **275 checks**) covers: protocol framing/validation (bad
   magic, truncated packets, oversized payloads, non-dictionary payloads, and the
   workspace message types `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/
-  `FILE_REMOVE`/`SCENE_LIST`, including text **and** byte payloads), invitation code
-  encode/decode, path guard (traversal/absolute/symlink), rate limiter, node-id
+  `FILE_REMOVE`/`SCENE_LIST`, including text **and** byte payloads), **relay
+  framing** (`CollabRelayProtocol` register/registered/member-join/data round
+  trips, short and oversized packets rejected), invitation code
+  encode/decode (including the relay `gc2.…` form), path guard
+  (traversal/absolute/symlink), rate limiter, node-id
   allocation (positive authoritative ids, `-1` sentinel avoidance, no id reuse
   after `clear()`), general property value encode/decode (vectors, rects,
   transforms, AABBs, `StringName`, arrays, dictionaries; refusal of containers
@@ -49,8 +52,14 @@ cd /path/to/godot-colab
   the old path removed), a **rejoin-desync** test (a
   client with a stale local scene joins, is snapshotted, and its later edits
   target the correct node; then it reconnects with a fresh client and is re-keyed
-  to host ids), and a **multi-scene isolation** test where the host is focused on
-  scene B while a client edits scene A (the edit must reach A, not B).
+  to host ids), a **multi-scene isolation** test where the host is focused on
+  scene B while a client edits scene A (the edit must reach A, not B), and a
+  **relay** test (`_test_relay_session`) that starts an in-process
+  `CollabRelayServer`, has a host and a client register to one room, and asserts
+  that registration assigns ids, that a HELLO is routed host→client via the relay,
+  that a cursor packet is relayed, and that a host departure disconnects the
+  client. A companion `_test_relay_token_rejection` asserts a client with a bad
+  room token is rejected with a clear error.
 
 Editor load / parse smoke check (confirms the plugin script parses in an editor
 context):
@@ -200,6 +209,22 @@ instances, enable **Godot Collab** in each, and run through the checks:
 14. **Git presence mode.** Start a session in **Git presence** mode on both
     sides: presence and cursors work, but scene edits are not applied, the
     download command is refused, and no local files are overwritten.
+15. **Relay session (no port forwarding).** Run the relay from a third terminal:
+
+    ```sh
+    ~/.apps/Godot/Godot_v4.7.2-stable_linux.x86_64 \
+      --headless --script tools/relay_server/relay_server.gd -- --port 45900
+    ```
+
+    On editor A, tick **Use a relay server**, enter `127.0.0.1` (or
+    `127.0.0.1:45900`), and click **Host**. The dock should report a relay
+    connection and generate a `gc2.…` code. On editor B, click **Paste & Join**
+    with that code (no extra configuration needed) and confirm the participant
+    list, remote cursors, and a supported edit all work through the relay.
+    Verify the host leaving disconnects the client with a clear message, and that
+    a client using a corrupted `gc2.…` code (wrong token) is rejected cleanly.
+    To exercise the relay path across two networks, run the relay on a host
+    reachable by both editors and open its **UDP** port in that host's firewall.
 
 ## Reporting results
 

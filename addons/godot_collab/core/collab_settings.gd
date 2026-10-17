@@ -15,6 +15,9 @@ const KEY_AUTO_CONNECT_LAST: String = SETTING_ROOT + "/identity/auto_connect_las
 const KEY_PORT: String = SETTING_ROOT + "/network/udp_port"
 const KEY_MAX_PEERS: String = SETTING_ROOT + "/network/max_peers"
 const KEY_RENDEZVOUS_URL: String = SETTING_ROOT + "/network/rendezvous_url"
+const KEY_USE_RELAY: String = SETTING_ROOT + "/network/use_relay"
+const KEY_RELAY_ADDRESS: String = SETTING_ROOT + "/network/relay_address"
+const KEY_RELAY_PORT: String = SETTING_ROOT + "/network/relay_port"
 const KEY_DIRECT_ADVERTISE_HOST: String = SETTING_ROOT + "/network/advertise_host"
 const KEY_ENABLE_UPNP: String = SETTING_ROOT + "/network/enable_upnp"
 const KEY_CURSOR_LABEL_KEY: String = SETTING_ROOT + "/cursors/show_labels"
@@ -50,6 +53,9 @@ func register_defaults() -> void:
 	_register(KEY_PORT, CollabConstants.DEFAULT_PORT, TYPE_INT, "UDP port used when hosting.")
 	_register(KEY_MAX_PEERS, CollabConstants.DEFAULT_MAX_PEERS, TYPE_INT, "Maximum number of remote peers.", 1, 64)
 	_register(KEY_RENDEZVOUS_URL, CollabConstants.DEFAULT_RENDEZVOUS_URL, TYPE_STRING, "Rendezvous service used to resolve invitation codes.")
+	_register(KEY_USE_RELAY, false, TYPE_BOOL, "Connect through a dedicated relay server instead of hosting/connecting directly. Works behind NAT/CGNAT with no port forwarding.")
+	_register(KEY_RELAY_ADDRESS, "", TYPE_STRING, "Relay server address (host or host:port). Required when relay mode is enabled.")
+	_register(KEY_RELAY_PORT, CollabConstants.DEFAULT_RELAY_PORT, TYPE_INT, "Relay server UDP port used when the address has no explicit port.", 1, 65535)
 	_register(KEY_DIRECT_ADVERTISE_HOST, "", TYPE_STRING, "Public IP/hostname advertised in invitation codes (blank = auto).")
 	_register(KEY_ENABLE_UPNP, false, TYPE_BOOL, "Attempt automatic UPnP UDP port forwarding when hosting.")
 	_register(KEY_CURSOR_LABEL_KEY, true, TYPE_BOOL, "Draw usernames next to remote cursors.")

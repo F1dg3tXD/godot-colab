@@ -25,8 +25,14 @@ structured, validated operation protocol.
   editor's global `MultiplayerAPI` peer.
 - Direct IP:port connections and short invitation codes resolved through an
   optional rendezvous service (`tools/rendezvous_server/`).
+- **Dedicated relay server** (`tools/relay_server/`) so two editors can
+  collaborate over the internet **without any port forwarding**: the host and
+  every client make outbound connections to the relay, which forwards opaque
+  packets between them. A relay invitation (`gc2.…`) embeds the relay endpoint
+  and a short room code. The relay never parses or stores scene, file or project
+  data. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Optional UPnP UDP port mapping, with honest connectivity reporting
-  (LAN-only vs. externally reachable vs. unverified).
+  (LAN-only vs. externally reachable vs. relay vs. unverified).
 - Remote 3D cursors and usernames drawn in the editor viewport, with per-user
   colours, interpolation, rate limiting, and stale-state removal.
 - Live 3D `editorNodeVis` markers for each remote participant, so collaborators
@@ -115,6 +121,21 @@ For LAN testing, use the host's LAN IP in a direct invitation. For internet
 testing, run the rendezvous service and/or configure UPnP or manual port
 forwarding. See [`docs/TESTING.md`](docs/TESTING.md).
 
+### Collaborating over the internet without port forwarding
+
+If neither side can open a UDP port (CGNAT, restrictive firewalls), run the
+relay server from a machine that both can reach:
+
+```
+godot --headless --script tools/relay_server/relay_server.gd -- --port 45900
+```
+
+Then, in the dock, tick **Use a relay server** and enter the relay's address
+(`host` or `host:port`), and click **Host**. Share the generated `gc2.…`
+invitation code; joining clients decode the relay endpoint and room from it, so
+they need no extra configuration. The relay only forwards bytes — it is not an
+application server, and it stores nothing on disk.
+
 ## Documentation
 
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — components, data flow,
@@ -125,6 +146,8 @@ forwarding. See [`docs/TESTING.md`](docs/TESTING.md).
 - [`docs/TESTING.md`](docs/TESTING.md) — reproducible automated and manual tests.
 - [`tools/rendezvous_server/`](tools/rendezvous_server/) — optional short-code
   lookup service.
+- [`tools/relay_server/`](tools/relay_server/) — optional dedicated relay server
+  for internet sessions without port forwarding.
 
 ## Repository layout
 
@@ -132,7 +155,7 @@ forwarding. See [`docs/TESTING.md`](docs/TESTING.md).
 addons/godot_collab/
   plugin.cfg, plugin.gd        EditorPlugin entry point + wiring
   core/                        constants, settings, logging, identity
-  network/                     wire protocol, ENet session manager, participants
+  network/                     wire protocol, ENet session manager, relay protocol/server, participants
   session/                     session coordinator, invite codes, rendezvous, UPnP, connectivity
   presence/                    local/remote cursor sampling and overlay drawing
   collaboration/               per-scene sync contexts, scene ops, node-id mapping, diff watcher, save, workspace authoring + source-file sync
@@ -142,6 +165,7 @@ addons/godot_collab/
   tests/                       headless test harness
 tests/minimal_project/         minimal 3D project for two-editor tests
 tools/rendezvous_server/       optional rendezvous service (Python stdlib)
+tools/relay_server/            optional dedicated relay server (headless Godot)
 docs/                          architecture, limitations, security, testing
 ```
 

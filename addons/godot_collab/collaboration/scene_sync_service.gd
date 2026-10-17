@@ -545,6 +545,10 @@ func _apply_property(op: Dictionary, ctx: CollabSceneContext) -> void:
 	if not CollabSceneOperations.is_property_syncable(node, property):
 		return
 	var kind: String = str(op.get("value_kind", ""))
+	if kind == CollabSceneOperations.VALUE_RESOURCE_CONTENT:
+		_apply_resource_content(node, property, op.get("value", null), ctx)
+		_drop_pending_resource(ctx.scene_id, int(op.get("node_id", -1)), property)
+		return
 	var value: Variant = CollabSceneOperations.decode_value(kind, op.get("value", null))
 	if CollabSceneOperations.is_resource_kind(kind) and value == null:
 		if _queue_pending_resource(ctx, int(op.get("node_id", -1)), property, kind, op.get("value")):
@@ -553,6 +557,24 @@ func _apply_property(op: Dictionary, ctx: CollabSceneContext) -> void:
 		return
 	_drop_pending_resource(ctx.scene_id, int(op.get("node_id", -1)), property)
 	_apply_property_editor_safe(node, property, value, ctx)
+
+
+## Applies a content-bearing resource value, merging onto any equivalent local
+## instance so shared references survive. Returns false (after reporting a
+## conflict) when the payload cannot be rebuilt from its text.
+func _apply_resource_content(node: Node, property: String, raw: Variant, ctx: CollabSceneContext) -> bool:
+	if typeof(raw) != TYPE_DICTIONARY:
+		conflict.emit("Resource content for '%s' was malformed." % property)
+		return false
+	var content: Dictionary = raw
+	var existing: Resource = node.get(property) as Resource
+	var resolved: Resource = CollabSceneOperations.apply_resource_content(
+		str(content.get("path", "")), str(content.get("text", "")), existing)
+	if resolved == null:
+		conflict.emit("Resource content for '%s' could not be rebuilt locally." % property)
+		return false
+	_apply_property_editor_safe(node, property, resolved, ctx, true)
+	return true
 
 
 ## Records a path-backed resource reference whose target file is not on disk yet
@@ -848,6 +870,9 @@ func _apply_snapshot_props(ctx: CollabSceneContext, entry: Dictionary, node: Nod
 			continue
 		var encoded: Dictionary = props[prop]
 		var kind: String = str(encoded.get("kind", ""))
+		if kind == CollabSceneOperations.VALUE_RESOURCE_CONTENT:
+			_apply_resource_content(node, prop, encoded.get("value"), ctx)
+			continue
 		var value: Variant = CollabSceneOperations.decode_value(kind, encoded.get("value", null))
 		if CollabSceneOperations.is_resource_kind(kind) and value == null:
 			_queue_pending_resource(ctx, ctx.node_ids.id_for(node), prop, kind, encoded.get("value"))
@@ -1039,8 +1064,8 @@ func _safe_name(requested: String) -> String:
 	return name
 
 
-func _apply_property_editor_safe(node: Node, property: String, value: Variant, ctx: CollabSceneContext) -> void:
-	if node.get(property) == value:
+func _apply_property_editor_safe(node: Node, property: String, value: Variant, ctx: CollabSceneContext, force: bool = false) -> void:
+	if not force and node.get(property) == value:
 		return
 	node.set(property, value)
 	if _is_active_root(ctx):
