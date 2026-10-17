@@ -35,7 +35,10 @@ static func encode_direct(host: String, port: int, token: String, project_id: St
 
 ## Encodes a relay invitation: the client must connect to [param relay_host]:[param relay_port]
 ## and register in [param room] with [param token]. The relay forwards to the host.
-static func encode_relay(relay_host: String, relay_port: int, room: String, token: String, project_id: String, workspace_mode: int) -> String:
+## [param rendezvous_url] (optional) is the rendezvous service bundled with the
+## relay; embedding it lets a client auto-configure the service URL when it pastes
+## this long code, so short codes work afterwards without manual configuration.
+static func encode_relay(relay_host: String, relay_port: int, room: String, token: String, project_id: String, workspace_mode: int, rendezvous_url: String = "") -> String:
 	var payload: Dictionary = {
 		"v": CollabConstants.PROTOCOL_VERSION,
 		"rh": relay_host,
@@ -44,6 +47,7 @@ static func encode_relay(relay_host: String, relay_port: int, room: String, toke
 		"t": token,
 		"pid": project_id,
 		"m": workspace_mode,
+		"rv": rendezvous_url,
 	}
 	var json: String = JSON.stringify(payload)
 	var b64: String = Marshalls.utf8_to_base64(json)
@@ -122,6 +126,7 @@ static func _decode_relay(text: String) -> Dictionary:
 		"token": str(data.get("t", "")),
 		"project_id": str(data.get("pid", "")),
 		"mode": int(data.get("m", 0)),
+		"rendezvous_url": str(data.get("rv", "")),
 	}
 
 

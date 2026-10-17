@@ -5,6 +5,10 @@ the internet **without port forwarding**. The session host and every client make
 outbound ENet/UDP connections to the relay; the relay forwards opaque packets
 between them.
 
+The same deployment can also run the **rendezvous service** (a tiny HTTP/Python
+helper) so hosts can offer short, human-shareable invite codes. The Docker image
+runs both together; see [Docker](#docker-recommended-for-server-hardware).
+
 It is deliberately *not* an application server:
 
 - It never parses scene, workspace, file or transfer payloads — it only moves the
@@ -56,11 +60,12 @@ need to be reachable from the editors on any port other than this one.
 
 The image installs a pinned, checksum-verified Godot 4.7.2 headless binary and
 generates the class cache during the build, so no editor or import step is needed
-at run time. Build from the repository root:
+at run time. It runs **both** the relay (UDP `45900`) and the rendezvous service
+(TCP `9080`) in one container. Build from the repository root:
 
 ```sh
 docker build -f tools/relay_server/Dockerfile -t godot-collab-relay:4.7.2 .
-docker run --rm -p 45900:45900/udp godot-collab-relay:4.7.2 --port 45900
+docker run --rm -p 45900:45900/udp -p 9080:9080/tcp godot-collab-relay:4.7.2
 ```
 
 Or with Compose (from `tools/relay_server/`):
@@ -69,21 +74,66 @@ Or with Compose (from `tools/relay_server/`):
 docker compose up -d --build
 ```
 
-The container publishes `45900/udp`; put it behind a reverse proxy or firewall
-rule as you would any UDP service, and expose it over `443`/WireGuard if you need
+The container publishes `45900/udp` (relay) and `9080/tcp` (rendezvous). Publish
+the rendezvous port only if you want short codes and HTTPS is not fronting it —
+otherwise short-code registration fails and the host falls back to the long
+`gc2.…` invitation, which still works. Put the relay behind the same firewall
+treatment as any UDP service, and expose it over `443`/WireGuard if you need
 privacy (see the encryption note above).
+
+### Container environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RELAY_PORT` | `45900` | Relay UDP port (ignored if CLI args are passed) |
+| `RELAY_BIND` | `*` | Relay bind address |
+| `RELAY_MAX_CLIENTS` | `64` | Max ENet clients on the relay |
+| `RENDEZVOUS_PORT` | `9080` | Rendezvous HTTP port |
+| `RENDEZVOUS_BIND` | `0.0.0.0` | Rendezvous bind address |
+
+Command-line arguments (for example `--port 45900`) are forwarded to the relay.
+Either service stopping shuts the container down.
 
 ## How editors use it
 
-1. In the dock, tick **Use a relay server** and enter the relay address (`host`
-   or `host:port`).
-2. Click **Host**. The dock generates a short room code and a `gc2.…` invitation
-   that embeds the relay endpoint, the room and the session token.
-3. A joining editor pastes the `gc2.…` code and joins through the same relay.
+Relay mode is the default hosting path (uncheck **Use a relay server** only for
+direct LAN hosting).
+
+1. In the dock, make sure **Use a relay server** is ticked and enter the relay
+   address (`host` or `host:port`).
+2. Click **Host**. The dock generates a room, a session token, and a `gc2.…`
+   invitation that embeds the relay endpoint, the room, the token, and the
+   rendezvous URL. If the **short invite code** option is enabled and the
+   rendezvous is reachable, a six-character code is registered instead.
+3. Share either invitation:
+   - **Long `gc2.…` code** — contains everything. A client that pastes it is
+     auto-configured: relay address, port, and the rendezvous URL are written to
+     settings, so future **short codes** work on that client with no manual setup.
+   - **Short code** (for example `AB12CD`) — the client must already know the
+     rendezvous URL (for example because it previously pasted a long code from
+     the same server, or it was set in the dock).
+4. The joining editor resolves the code to the relay endpoint and joins the room.
 
 The relay assigns the host application id `1` and clients `2, 3, …`, mirroring
 direct-connect ids, so the rest of the add-on is unchanged. When the host leaves,
 the relay closes the room and disconnects its clients.
+
+## Rendezvous service
+
+The rendezvous is a small HTTP service (`tools/rendezvous_server/rendezvous_server.py`,
+Python 3, standard library only) that maps a short code to connection info:
+either a `direct` endpoint or a `relay` room. It stores entries in memory with a
+TTL and never sees session traffic. Endpoints:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/register` | Register a code (direct or relay) with a TTL |
+| `GET` | `/lookup?code=…` | Resolve a code to its connection info |
+| `POST` | `/unregister` | Remove a code (requires its token) |
+| `GET` | `/health` | Liveness probe |
+
+Run it directly with `python3 tools/rendezvous_server/rendezvous_server.py
+--port 9080`, or let the Docker image run it alongside the relay.
 
 ## Limits
 

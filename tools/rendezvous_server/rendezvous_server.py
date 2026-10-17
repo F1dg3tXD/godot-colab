@@ -2,8 +2,10 @@
 """Optional rendezvous service for Godot Collab.
 
 The rendezvous maps a short invitation code (for example ``K7P2QX``) to the
-direct ENet endpoint of the hosting editor. It is deliberately *not* a relay:
-after resolving a code the client still connects directly to the host over UDP.
+endpoint of the hosting editor. It resolves to either a *direct* ENet endpoint
+(host + UDP port) or a *relay* room (relay host + port + room). It is itself
+deliberately *not* a relay: after resolving a code the client still connects to
+the host or the relay, and never routes session traffic through this service.
 
 Only the Python 3 standard library is used, so it can run anywhere without
 extra dependencies:
@@ -13,10 +15,15 @@ extra dependencies:
 Endpoints
 ---------
 POST /register
-    body: {"code","host","port","token","ttl","project_id","mode"}
+    direct: {"kind":"direct","code","host","port","token","ttl","project_id","mode"}
+    relay:  {"kind":"relay","code","relay_host","relay_port","room","token","ttl",
+             "project_id","mode"}
+    (`kind` is optional and defaults to "direct" for older clients.)
     -> {"ok":true,"expires":<unix-ts>}
 GET  /lookup?code=XXXX
-    -> {"ok":true,"host","port","token","project_id","mode","expires"}
+    direct -> {"ok":true,"kind":"direct","host","port","token","project_id","mode","expires"}
+    relay  -> {"ok":true,"kind":"relay","relay_host","relay_port","room","token",
+              "project_id","mode","expires"}
 POST /unregister
     body: {"code","token"} -> {"ok":true}
 GET  /health
@@ -64,25 +71,41 @@ class Store:
         code = str(payload.get("code", "")).upper()
         if not CODE_RE.match(code):
             raise ValueError("invalid code format")
-        host = str(payload.get("host", "")).strip()
-        if not host:
-            raise ValueError("missing host")
-        port = int(payload.get("port", 0))
-        if not (1 <= port <= 65535):
-            raise ValueError("invalid port")
+        kind = str(payload.get("kind", "direct")).strip().lower()
+        if kind not in ("direct", "relay"):
+            raise ValueError("invalid kind")
         ttl = int(payload.get("ttl", DEFAULT_TTL))
         ttl = max(30, min(ttl, 3600))
+        entry = {
+            "kind": kind,
+            "token": str(payload.get("token", "")),
+            "project_id": str(payload.get("project_id", "")),
+            "mode": int(payload.get("mode", 0)),
+        }
+        if kind == "relay":
+            relay_host = str(payload.get("relay_host", "")).strip()
+            if not relay_host:
+                raise ValueError("missing relay_host")
+            relay_port = int(payload.get("relay_port", 0))
+            if not (1 <= relay_port <= 65535):
+                raise ValueError("invalid relay_port")
+            room = str(payload.get("room", "")).strip()
+            if not room or len(room) > 64:
+                raise ValueError("invalid room")
+            entry.update({"relay_host": relay_host, "relay_port": relay_port, "room": room})
+        else:
+            host = str(payload.get("host", "")).strip()
+            if not host:
+                raise ValueError("missing host")
+            port = int(payload.get("port", 0))
+            if not (1 <= port <= 65535):
+                raise ValueError("invalid port")
+            entry.update({"host": host, "port": port})
         with self._lock:
             self.prune()
-            self._entries[code] = {
-                "host": host,
-                "port": port,
-                "token": str(payload.get("token", "")),
-                "project_id": str(payload.get("project_id", "")),
-                "mode": int(payload.get("mode", 0)),
-                "expires": time.time() + ttl,
-            }
-            return {"ok": True, "expires": int(self._entries[code]["expires"])}
+            entry["expires"] = time.time() + ttl
+            self._entries[code] = entry
+            return {"ok": True, "expires": int(entry["expires"])}
 
     def unregister(self, payload: dict) -> dict:
         code = str(payload.get("code", "")).upper()

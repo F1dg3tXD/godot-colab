@@ -6,7 +6,10 @@ services:
       args:
         GODOT_VERSION: "4.7.2"
     image: godot-collab-relay:4.7.2
-    command: ["--port", "45900"]
+    environment:
+      RELAY_PORT: "45900"
+      RENDEZVOUS_PORT: "9080"
     ports:
       - "45900:45900/udp"
+      - "9080:9080/tcp"
     restart: unless-stopped

@@ -28,9 +28,11 @@ structured, validated operation protocol.
 - **Dedicated relay server** (`tools/relay_server/`) so two editors can
   collaborate over the internet **without any port forwarding**: the host and
   every client make outbound connections to the relay, which forwards opaque
-  packets between them. A relay invitation (`gc2.…`) embeds the relay endpoint
-  and a short room code. The relay never parses or stores scene, file or project
-  data. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+  packets between them. A relay invitation (`gc2.…`) embeds the relay endpoint,
+  a room, the session token, and the rendezvous URL. The relay never parses or
+  stores scene, file or project data. The Docker image also bundles the short-code
+  rendezvous service so a host can offer a short code instead. See
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 - Optional UPnP UDP port mapping, with honest connectivity reporting
   (LAN-only vs. externally reachable vs. relay vs. unverified).
 - Remote 3D cursors and usernames drawn in the editor viewport, with per-user
@@ -117,33 +119,39 @@ peers, and UPnP mapping.
    files (scripts, `project.godot`) are relayed as well — but never edit files
    under `addons/` while a session is live.
 
-For LAN testing, use the host's LAN IP in a direct invitation. For internet
-testing, run the rendezvous service and/or configure UPnP or manual port
-forwarding. See [`docs/TESTING.md`](docs/TESTING.md).
+For internet use, relay mode is the default (see the next section). For direct
+LAN hosting, uncheck **Use a relay server** and use the host's LAN IP in a direct
+invitation; the rendezvous service, UPnP, and manual port forwarding are optional
+refinements. See [`docs/TESTING.md`](docs/TESTING.md).
 
 ### Collaborating over the internet without port forwarding
 
-If neither side can open a UDP port (CGNAT, restrictive firewalls), run the
-relay server from a machine that both can reach:
+Relay mode is the default hosting path: the host and every client connect
+*outbound* to a relay server, so no port forwarding is needed (works behind
+CGNAT and restrictive firewalls). Run the relay from a machine that both sides
+can reach:
 
 ```
 GODOT=/path/to/godot tools/relay_server/run.sh --port 45900
 ```
 
 The wrapper imports the project once (to build the GDScript class cache a fresh
-checkout lacks) and then starts the relay. A Docker image is also provided for
-server hosts:
+checkout lacks) and then starts the relay. A Docker image is also provided; it
+runs the relay (UDP `45900`) **and** the short-code rendezvous (TCP `9080`) in one
+container:
 
 ```
 docker build -f tools/relay_server/Dockerfile -t godot-collab-relay:4.7.2 .
-docker run --rm -p 45900:45900/udp godot-collab-relay:4.7.2 --port 45900
+docker run --rm -p 45900:45900/udp -p 9080:9080/tcp godot-collab-relay:4.7.2
 ```
 
-Then, in the dock, tick **Use a relay server** and enter the relay's address
-(`host` or `host:port`), and click **Host**. Share the generated `gc2.…`
-invitation code; joining clients decode the relay endpoint and room from it, so
-they need no extra configuration. The relay only forwards bytes — it is not an
-application server, and it stores nothing on disk.
+Then, in the dock, make sure **Use a relay server** is ticked, enter the relay's
+address (`host` or `host:port`), and click **Host**. Share the generated `gc2.…`
+invitation code; joining clients decode the relay endpoint, room, and rendezvous
+URL from it, so **pasting the long code sets the client up automatically** — after
+that, six-character short codes from the same server work with no manual setup.
+The relay only forwards bytes — it is not an application server, and it stores
+nothing on disk.
 
 ## Documentation
 
@@ -155,8 +163,9 @@ application server, and it stores nothing on disk.
 - [`docs/TESTING.md`](docs/TESTING.md) — reproducible automated and manual tests.
 - [`tools/rendezvous_server/`](tools/rendezvous_server/) — optional short-code
   lookup service.
-- [`tools/relay_server/`](tools/relay_server/) — optional dedicated relay server
-  for internet sessions without port forwarding.
+- [`tools/relay_server/`](tools/relay_server/) — dedicated relay server (headless
+  Godot, with a Docker image) for internet sessions without port forwarding; the
+  image also bundles the rendezvous service for short codes.
 
 ## Repository layout
 
@@ -174,7 +183,7 @@ addons/godot_collab/
   tests/                       headless test harness
 tests/minimal_project/         minimal 3D project for two-editor tests
 tools/rendezvous_server/       optional rendezvous service (Python stdlib)
-tools/relay_server/            optional dedicated relay server (headless Godot)
+tools/relay_server/            relay + bundled rendezvous (headless Godot + Dockerfile/compose)
 docs/                          architecture, limitations, security, testing
 ```
 

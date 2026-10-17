@@ -425,10 +425,26 @@ The add-on supports three ways to reach a session, all over ENet/UDP:
    (`CollabInviteCode.encode_direct`, `gc1.…`). Works on LAN and loopback; over
    the internet it needs a reachable host port (UPnP or manual forwarding).
 2. **Rendezvous short code** — a 6-character code registered with
-   `tools/rendezvous_server/` resolves to a direct endpoint. The rendezvous is a
-   lookup service, not a relay; the data path is still direct.
+   `tools/rendezvous_server/` resolves to an endpoint. The rendezvous is a lookup
+   service, not a relay; the data path is still direct or relay.
 3. **Relay** — both sides connect outbound to a dedicated relay
    (`tools/relay_server/`). This works behind NAT/CGNAT with no port forwarding.
+   Relay is the **default** hosting path.
+
+The rendezvous and relay are orthogonal: a host in relay mode can *also* register
+a short code, in which case the rendezvous entry stores the relay endpoint + room
+(`kind: "relay"`) rather than a direct `ip:port`. Both services are bundled in the
+relay Docker image, and the derived rendezvous URL for a relay host is
+`http://<relay-host>:9080` unless overridden.
+
+### Invitation codes
+
+- `gc1.…` (direct) embeds `host`, `port`, `token`, `project_id`, `mode`.
+- `gc2.…` (relay) embeds `relay_host`, `relay_port`, `room`, `token`,
+  `project_id`, `mode`, and the **rendezvous URL** (`rv`). Because it carries the
+  rendezvous URL, pasting a long relay code auto-configures the client's relay
+  address, relay port, and rendezvous URL in settings; subsequent short codes from
+  the same server then resolve with no manual setup.
 
 ### Relay path
 
@@ -480,12 +496,14 @@ label/size/depth, auto-save + delay, download directory, per-file/total transfer
 limits, join approval, invite-token requirement, workspace authoring, and
 source-file sync. Session tokens are never written to committed project files.
 
-Two defaults favour zero-configuration LAN use: the rendezvous URL default is
-empty (`DEFAULT_RENDEZVOUS_URL = ""`, so short codes are unavailable until a
-service is configured and direct `host:port` / LAN invites are used), and
-**host approval is off by default** (`security/approve_joins = false`).
-Approval is an opt-in for untrusted networks; when enabled, the host must confirm
-each participant before workspace access is granted.
+One default favours internet use and one favours zero-configuration joins: **relay
+mode is on by default** (`network/use_relay = true`, so hosting uses a relay
+address if one is configured), and **host approval is off by default**
+(`security/approve_joins = false`). The rendezvous URL default is empty
+(`DEFAULT_RENDEZVOUS_URL = ""`); it is auto-derived from the relay address when
+relay mode is used, so short codes become available as soon as a relay address is
+entered. Approval is an opt-in for untrusted networks; when enabled, the host must
+confirm each participant before workspace access is granted.
 
 ## Lifecycle
 

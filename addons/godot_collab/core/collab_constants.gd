@@ -46,6 +46,12 @@ const DEFAULT_MAX_PEERS: int = 8
 ## Settings (`godot_collab/network/rendezvous_url`).
 const DEFAULT_RENDEZVOUS_URL: String = ""
 
+## Default TCP port the bundled rendezvous service listens on. The relay Docker
+## image runs the relay and this rendezvous together, so a relay session can also
+## register a short code. When no explicit rendezvous URL is configured the host
+## derives one from the relay address using this port.
+const DEFAULT_RENDEZVOUS_PORT: int = 9080
+
 ## Session invitation codes expire after this many seconds unless refreshed.
 const INVITE_TTL_SECONDS: int = 600
 

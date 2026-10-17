@@ -472,9 +472,11 @@ func _test_pending_resource_resolution() -> void:
 
 func _test_settings_defaults() -> void:
 	print("[settings defaults]")
-	# A fresh install must be usable on a LAN without any service or approval
-	# step; both are opt-in.
-	_check(CollabConstants.DEFAULT_RENDEZVOUS_URL.is_empty(), "rendezvous defaults to empty (LAN/direct connect)")
+	# Registered defaults live in EditorSettings (unavailable headless); these
+	# assertions cover the constants and the call-site fallbacks instead.
+	_check(CollabConstants.DEFAULT_RENDEZVOUS_URL.is_empty(), "rendezvous defaults to empty (relay-derived or configured)")
+	_check(CollabConstants.DEFAULT_RELAY_PORT == 45900, "relay default port is 45900")
+	_check(CollabConstants.DEFAULT_RENDEZVOUS_PORT == 9080, "rendezvous default port is 9080")
 	_check(not CollabSettings.new().get_bool(CollabSettings.KEY_APPROVE_JOINS, false), "host approval defaults to off")
 	# A single dropped file is delivered in one workspace packet, so the per-file
 	# cap must not exceed the packet cap.
@@ -606,7 +608,7 @@ func _test_invite_codes() -> void:
 	var short: Dictionary = CollabInviteCode.decode("K7P2QX")
 	_check(str(short.get("kind", "")) == "short" and str(short.get("code", "")) == "K7P2QX", "short code parsed")
 
-	var relay_invite: String = CollabInviteCode.encode_relay("relay.example.net", 45900, "AB12CD", "tok123", "proj-1", CollabConstants.WorkspaceMode.HOST_WORKSPACE)
+	var relay_invite: String = CollabInviteCode.encode_relay("relay.example.net", 45900, "AB12CD", "tok123", "proj-1", CollabConstants.WorkspaceMode.HOST_WORKSPACE, "http://relay.example.net:9080")
 	_check(relay_invite.begins_with("gc2."), "relay invite prefixed")
 	var relay_parsed: Dictionary = CollabInviteCode.decode(relay_invite)
 	_check(str(relay_parsed.get("kind", "")) == "relay", "relay kind")
@@ -614,6 +616,7 @@ func _test_invite_codes() -> void:
 	_check(int(relay_parsed.get("port", 0)) == 45900, "relay port round-trips")
 	_check(str(relay_parsed.get("room", "")) == "AB12CD", "relay room round-trips")
 	_check(str(relay_parsed.get("token", "")) == "tok123", "relay token round-trips")
+	_check(str(relay_parsed.get("rendezvous_url", "")) == "http://relay.example.net:9080", "relay rendezvous URL round-trips")
 	_check(str(CollabInviteCode.decode("gc2.not-base64!!").get("kind", "")) == "invalid", "corrupt relay invite rejected")
 
 	var address: Dictionary = CollabInviteCode.decode("10.0.0.2:45899")

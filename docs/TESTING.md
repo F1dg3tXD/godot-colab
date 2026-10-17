@@ -13,13 +13,14 @@ cd /path/to/godot-colab
 - Exit code `0` and a final `RESULT: PASS` mean all checks passed.
 - Exit code `1` with `RESULT: FAIL` means at least one check failed; each failure
   is printed individually.
-- The suite (currently **275 checks**) covers: protocol framing/validation (bad
+- The suite (currently **278 checks**) covers: protocol framing/validation (bad
   magic, truncated packets, oversized payloads, non-dictionary payloads, and the
   workspace message types `WORKSPACE_REQUEST`/`WORKSPACE_RESULT`/`FILE_APPLY`/
   `FILE_REMOVE`/`SCENE_LIST`, including text **and** byte payloads), **relay
   framing** (`CollabRelayProtocol` register/registered/member-join/data round
   trips, short and oversized packets rejected), invitation code
-  encode/decode (including the relay `gc2.…` form), path guard
+  encode/decode (including the relay `gc2.…` form **and its embedded rendezvous
+  URL**), path guard
   (traversal/absolute/symlink), rate limiter, node-id
   allocation (positive authoritative ids, `-1` sentinel avoidance, no id reuse
   after `clear()`), general property value encode/decode (vectors, rects,
@@ -30,7 +31,8 @@ cd /path/to/godot-colab
   queueing and resolution** (an unresolved path resource is queued, resolves on a
   later poll, and times out to a conflict; the queue is capped),
   **settings defaults**
-  (empty rendezvous default, approval off by default, per-file cap ≤ packet cap),
+  (empty rendezvous default, relay default port 45900, rendezvous default port
+  9080, approval off by default, per-file cap ≤ packet cap),
   `is_syncable_property_name` (slash sub-properties allowed;
   `_`/`metadata/`/reserved refused) and `collect_syncable_props` behaviour
   (general properties accepted, `name`/`script`/`transform` reserved), source-file
@@ -80,6 +82,13 @@ Optional rendezvous service (Python 3 stdlib only):
 python3 tools/rendezvous_server/rendezvous_server.py --host 127.0.0.1 --port 9080
 # health check:
 curl http://127.0.0.1:9080/health
+```
+
+The rendezvous `Store` (direct and relay entry registration/lookup) has unit
+tests that need no network:
+
+```sh
+python3 tools/rendezvous_server/test_rendezvous.py   # 6 tests, OK
 ```
 
 ### Automated coverage vs. GUI coverage
@@ -209,7 +218,8 @@ instances, enable **Godot Collab** in each, and run through the checks:
 14. **Git presence mode.** Start a session in **Git presence** mode on both
     sides: presence and cursors work, but scene edits are not applied, the
     download command is refused, and no local files are overwritten.
-15. **Relay session (no port forwarding).** Run the relay from a third terminal:
+15. **Relay session (no port forwarding).** Relay is the default hosting path. Run
+    the relay from a third terminal:
 
     ```sh
     GODOT=~/.apps/Godot/Godot_v4.7.2-stable_linux.x86_64 \
@@ -221,15 +231,40 @@ instances, enable **Godot Collab** in each, and run through the checks:
     `Could not find type "CollabRelayServer"` until `godot --headless --import`
     has run once.)
 
-    On editor A, tick **Use a relay server**, enter `127.0.0.1` (or
-    `127.0.0.1:45900`), and click **Host**. The dock should report a relay
+    On editor A, tick **Use a relay server** (on by default), enter `127.0.0.1`
+    (or `127.0.0.1:45900`), and click **Host**. The dock should report a relay
     connection and generate a `gc2.…` code. On editor B, click **Paste & Join**
-    with that code (no extra configuration needed) and confirm the participant
-    list, remote cursors, and a supported edit all work through the relay.
-    Verify the host leaving disconnects the client with a clear message, and that
-    a client using a corrupted `gc2.…` code (wrong token) is rejected cleanly.
-    To exercise the relay path across two networks, run the relay on a host
-    reachable by both editors and open its **UDP** port in that host's firewall.
+    with that code (it auto-configures the relay and rendezvous URL) and confirm
+    the participant list, remote cursors, and a supported edit all work through
+    the relay. Verify the host leaving disconnects the client with a clear message,
+    and that a client using a corrupted `gc2.…` code (wrong token) is rejected
+    cleanly. To exercise the relay path across two networks, run the relay on a
+    host reachable by both editors and open its **UDP** port in that host's
+    firewall.
+
+    Also verify the direct-hosting fallback: with **Use a relay server** ticked
+    but the address field empty, **Host** reports that it is hosting directly and
+    opens no relay connection.
+
+16. **Bundled rendezvous + short codes.** Run the relay Docker image, which hosts
+    both services:
+
+    ```sh
+    docker build -f tools/relay_server/Dockerfile -t godot-collab-relay:4.7.2 .
+    docker run --rm -p 45900:45900/udp -p 9080:9080/tcp \
+      -e RELAY_PORT=45900 -e RENDEZVOUS_PORT=9080 godot-collab-relay:4.7.2
+    ```
+
+    Check `curl http://127.0.0.1:9080/health` returns `{"ok": true}`. On editor A,
+    tick **Use a relay server** and **Register a short invite code**, enter
+    `127.0.0.1`, and **Host**; the dock shows a 6-character code. On editor B,
+    click **Paste & Join** with the long `gc2.…` code first (this sets B's
+    rendezvous URL), then disconnect and join with editor A's *short* code — it
+    should resolve and connect. A client that has never seen the long code and has
+    no rendezvous URL configured should report a clear "configure the rendezvous
+    service" error for a short code. Verify the rendezvous endpoint directly:
+    `POST /register` with a `kind:"relay"` body, then `GET /lookup?code=…` returns
+    the relay host/port/room.
 
 ## Reporting results
 

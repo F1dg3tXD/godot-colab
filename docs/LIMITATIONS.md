@@ -44,16 +44,23 @@ are listed explicitly so nothing here is mistaken for working functionality.
   CGNAT / restrictive firewalls with no port forwarding, and the relay path is
   covered by in-process loopback tests (registration, HELLO routing, cursor
   relay, token rejection, host departure). It has **not** been exercised across a
-  real internet relay or a real NAT. Direct connectivity is still the default;
-  relay mode is opt-in in the dock.
+  real internet relay or a real NAT. Relay mode is the **default** hosting path;
+  if no relay address is configured the host falls back to a direct session with a
+  warning, and direct LAN hosting is still available (uncheck *Use a relay server*).
 - **After a relay or direct connection is established, there is no relay
   fallback.** If the relay process stops or the host leaves, clients are
   disconnected; there is no automatic reconnection or migration.
 - **UPnP is best-effort** and may silently fail on many routers. Failures are
   reported in the dock; manual port forwarding is the fallback.
-- The rendezvous service maps short codes to endpoints; it is **not** an ENet
-  relay and does not carry session traffic. Its default configuration is plain
-  HTTP on localhost.
+- The rendezvous service maps short codes to endpoints (direct **or** relay
+  rooms); it is **not** an ENet relay and does not carry session traffic. It runs
+  as part of the relay Docker image but is a separate plain-HTTP service on
+  `9080/tcp`; short codes only work when that port is reachable (or fronted by
+  HTTPS). When short-code registration fails, the host falls back to the long
+  `gc2.…` invitation, which still works.
+- The long relay invitation embeds the rendezvous URL so a client that pastes it
+  auto-configures the service; this is stored in editor settings and is a
+  convenience, not a trust decision.
 - Short code lookup, direct connection and the relay have only been exercised in
   local and loopback-style testing, not across real NATs between two networks.
 

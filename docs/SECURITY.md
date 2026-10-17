@@ -58,16 +58,30 @@ protect against, and how to configure it safely.
 
 ## Rendezvous service
 
-- Ships configured for localhost/plain HTTP. For any non-local use, run it behind
-  TLS (reverse proxy) and treat codes as secrets. It maps codes to endpoints and
-  rate-limits failed lookups, but it does not authenticate hosts.
+- Ships configured for localhost/plain HTTP. The relay Docker image runs it
+  alongside the relay on `9080/tcp` (plain HTTP); for any non-local use, run it
+  behind TLS (reverse proxy) and treat codes as secrets. It maps codes to
+  endpoints (**direct `ip:port` or relay rooms**) and rate-limits failed lookups,
+  but it does not authenticate hosts.
 - The rendezvous service does not relay session traffic.
+- A long relay invitation embeds the rendezvous URL; pasting it auto-configures
+  the client's rendezvous setting. This is a convenience for reachability, not a
+  trust decision — the session token still gates the connection.
+
+## Relay server
+
+- The relay forwards opaque `CollabRelayProtocol` frames between peers in a room.
+  It does not parse application payloads, write to disk, or authenticate peers
+  beyond the room token it was given at registration. Anyone who learns a room
+  code *and* its token can join.
+- Relay traffic is plain ENet/UDP and is **not encrypted**; add WireGuard/SSH or
+  another tunnel if confidentiality is required.
 
 ## Recommended safe configuration
 
 - Keep **require invite token** and **approve joins** enabled.
-- Prefer LAN or a trusted network for testing; use a VPN or a TLS-terminated
-  rendezvous setup for anything wider.
+- Prefer LAN or a trusted network for testing; for wider use, run the relay and
+  rendezvous behind a VPN or a TLS-terminated reverse proxy.
 - Set conservative **per-file** and **total transfer** limits and a dedicated
   download directory.
 - Only approve participants you expect.

@@ -45,6 +45,7 @@ func register_code(code: String, host: String, port: int, token: String, ttl: in
 	_queue.append({
 		"kind": "register", "code": code,
 		"body": {
+			"kind": "direct",
 			"code": code, "host": host, "port": port, "token": token,
 			"ttl": ttl, "project_id": project_id, "mode": mode,
 		},
@@ -52,7 +53,27 @@ func register_code(code: String, host: String, port: int, token: String, ttl: in
 	_pump()
 
 
-## Resolves a short code to a direct endpoint.
+## Registers a short code that resolves to a *relay* session. A client that
+## looks the code up receives the relay endpoint, room and token, so a short code
+## works for relay-hosted sessions too (the client still needs this rendezvous'
+## URL configured, which the long relay code embeds).
+func register_relay_code(code: String, relay_host: String, relay_port: int, room: String, token: String, ttl: int, project_id: String, mode: int) -> void:
+	if not is_configured():
+		registered.emit(code, false, "no rendezvous service configured")
+		return
+	_queue.append({
+		"kind": "register", "code": code,
+		"body": {
+			"kind": "relay",
+			"code": code, "relay_host": relay_host, "relay_port": relay_port,
+			"room": room, "token": token,
+			"ttl": ttl, "project_id": project_id, "mode": mode,
+		},
+	})
+	_pump()
+
+
+## Resolves a short code to a direct endpoint or a relay room.
 func lookup(code: String) -> void:
 	if not is_configured():
 		lookup_completed.emit(code, false, {}, "no rendezvous service configured")
