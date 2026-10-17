@@ -127,7 +127,16 @@ If neither side can open a UDP port (CGNAT, restrictive firewalls), run the
 relay server from a machine that both can reach:
 
 ```
-godot --headless --script tools/relay_server/relay_server.gd -- --port 45900
+GODOT=/path/to/godot tools/relay_server/run.sh --port 45900
+```
+
+The wrapper imports the project once (to build the GDScript class cache a fresh
+checkout lacks) and then starts the relay. A Docker image is also provided for
+server hosts:
+
+```
+docker build -f tools/relay_server/Dockerfile -t godot-collab-relay:4.7.2 .
+docker run --rm -p 45900:45900/udp godot-collab-relay:4.7.2 --port 45900
 ```
 
 Then, in the dock, tick **Use a relay server** and enter the relay's address

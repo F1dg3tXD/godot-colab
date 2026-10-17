@@ -212,9 +212,14 @@ instances, enable **Godot Collab** in each, and run through the checks:
 15. **Relay session (no port forwarding).** Run the relay from a third terminal:
 
     ```sh
-    ~/.apps/Godot/Godot_v4.7.2-stable_linux.x86_64 \
-      --headless --script tools/relay_server/relay_server.gd -- --port 45900
+    GODOT=~/.apps/Godot/Godot_v4.7.2-stable_linux.x86_64 \
+      tools/relay_server/run.sh --port 45900
     ```
+
+    (`run.sh` builds the GDScript class cache on first run; on a fresh checkout
+    the plain `godot --headless --script ...` form fails with
+    `Could not find type "CollabRelayServer"` until `godot --headless --import`
+    has run once.)
 
     On editor A, tick **Use a relay server**, enter `127.0.0.1` (or
     `127.0.0.1:45900`), and click **Host**. The dock should report a relay

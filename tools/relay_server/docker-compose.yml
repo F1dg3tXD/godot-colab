@@ -1,0 +1,12 @@
+services:
+  relay:
+    build:
+      context: ../..
+      dockerfile: tools/relay_server/Dockerfile
+      args:
+        GODOT_VERSION: "4.7.2"
+    image: godot-collab-relay:4.7.2
+    command: ["--port", "45900"]
+    ports:
+      - "45900:45900/udp"
+    restart: unless-stopped
